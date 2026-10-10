@@ -166,7 +166,23 @@ def company_relevance(company, title, body):
 # ============================================================
 # SEARCH
 # ============================================================
+@st.cache_resource
+def _search_cache():
+    return {}
+
+
 def web_search(query, n=10):
+    key = (query, n, bool(CFG.get("serper")))
+    cache = _search_cache()
+    if key in cache:
+        return cache[key]
+    out = _web_search(query, n)
+    if out:
+        cache[key] = out
+    return out
+
+
+def _web_search(query, n=10):
     for _ in range(2):
         try:
             if CFG.get("serper"):
@@ -184,16 +200,19 @@ def web_search(query, n=10):
 
 
 def search_company(company, groups, broad):
+    """A few combined LinkedIn searches (instead of one per job type)."""
     candidates = {}
-    queries = []
-    for category, roles in groups.items():
-        role_string = " OR ".join(f'"{r}"' for r in roles[:5])
-        queries.append((category, f'site:linkedin.com/in/ "{company}" ({role_string})'))
+    items = []
+    for roles in groups.values():
+        items += sorted(roles, key=lambda r: -ROLE_PRIORITY.get(r, 50))[:6]
+    items = list(dict.fromkeys(items))
+    chunks = [items[i:i + 6] for i in range(0, len(items), 6)][:4]
+    queries = [f'site:linkedin.com/in/ "{company}" (' + " OR ".join(f'"{r}"' for r in c) + ")"
+               for c in chunks]
     if broad:
-        queries += [("General", f'site:linkedin.com/in/ "{company}"'),
-                    ("General", f'site:linkedin.com/in/ "{company}" leadership')]
+        queries.append(f'site:linkedin.com/in/ "{company}" leadership')
 
-    for category, query in queries:
+    for query in queries:
         for res in web_search(query, 10):
             url = clean_url(res.get("href", ""))
             if "linkedin.com/in/" not in url.lower():
@@ -205,9 +224,9 @@ def search_company(company, groups, broad):
                 continue
             cat, role, prio = classify_person(title + " " + body, groups)
             if not cat:
-                if category == "General":
-                    continue  # unrelated person from a broad search
-                cat, role, prio = category, "", 30
+                if not broad:
+                    continue
+                cat, role, prio = "Other", "", 30
             score = company_relevance(company, title, body) + prio
             old = candidates.get(url)
             if not old or score > old["score"]:
@@ -215,7 +234,8 @@ def search_company(company, groups, broad):
                                    "title": extract_title(title, company), "category": cat,
                                    "role": role, "score": score,
                                    "instagram": "", "emails": [], "phones": []}
-        time.sleep(1.0 if not CFG.get("serper") else 0)
+        if not CFG.get("serper"):
+            time.sleep(1.0)
     return list(candidates.values())
 
 
@@ -281,6 +301,11 @@ def find_instagram(name, company):
     return ""
 
 
+GENERIC_LOCALS = {"info", "hello", "hi", "contact", "contactus", "press", "media", "pr", "team", "office",
+                  "admin", "support", "careers", "hr", "sales", "enquiries", "inquiries", "enquiry",
+                  "mail", "connect", "invest", "pitch", "pitches", "founders", "startups", "deals",
+                  "dealflow", "marketing", "communications", "events", "business", "bd", "general",
+                  "reach", "ask", "help", "partnerships", "partners", "investors", "ir", "feedback"}
 TEAM_PATHS = ("", "/team", "/our-team", "/people", "/about", "/about-us", "/who-we-are",
               "/partners", "/contact", "/contact-us")
 ROLE_WORDS = re.compile(r"\b(partner|principal|associate|analyst|founder|co-founder|managing|director|"
@@ -416,24 +441,34 @@ def merge_people(web, searched):
     return out
 
 
-def process_company(row, groups, per_co, broad, want_ig, want_contact, use_company_level, is_vc=False):
+def process_company(row, groups, per_co, broad, want_ig, use_company_level):
     company = row["company"]
-    site = row.get("website") or (guess_website(company) if (want_contact or is_vc) else "")
+    site = row.get("website")
+    if not isinstance(site, str) or not site.strip():
+        site = guess_website(company)
     web_people, emails, phones = [], [], []
-    if site and is_vc:
-        web_people, emails, phones = scrape_team(site, company, groups, broad)
-    elif site and want_contact:
-        emails, phones = site_contacts(site)
-    searched = rank_people(search_company(company, groups, broad), per_co)
-    people = merge_people(web_people[:30], searched)
-    if want_contact:
-        for p in people:
-            if not p["emails"]:
-                p["emails"] = assign_emails(p["name"], emails, use_company_level)
-            if not p["phones"] and use_company_level:
-                p["phones"] = phones[:1]
-    if want_ig:
-        for p in people:
+    if site:
+        try:
+            web_people, emails, phones = scrape_team(site, company, groups, broad)
+        except Exception:
+            pass
+    searched = []
+    if broad or len(web_people) < per_co:  # website already gave enough? skip the slower search
+        searched = rank_people(search_company(company, groups, broad), per_co)
+    people = merge_people(web_people, searched)
+    people.sort(key=lambda p: p["score"], reverse=True)
+    people = people[:per_co]
+    # company-level emails = ones that don't belong to any named person (info@, hello@, press@)
+    generic = [e for e in emails if re.split(r"[^a-z]", e.split("@")[0])[0] in GENERIC_LOCALS]
+    for p in people:
+        p["website"] = site or ""
+        if not p["emails"]:
+            mine = re.findall(r"[a-z]{3,}", p["name"].lower())
+            personal = [e for e in emails if any(t in e.split("@")[0] for t in mine)]
+            p["emails"] = (personal + (generic if use_company_level else []))[:4]
+        if not p["phones"] and use_company_level:
+            p["phones"] = phones[:1]
+        if want_ig:
             p["instagram"] = find_instagram(p["name"], company)
     return people
 
@@ -528,16 +563,12 @@ def build_dataframe(people, cols):
     out = []
     for i, p in enumerate(people, 1):
         d = {"Sr No": i, "Name": p["name"], "Designation": p["title"],
-             "Company": p["company"], "LinkedIn": p["linkedin"]}
-        if "Category" in cols:
-            d["Role Category"] = p["category"]
+             "Company": p["company"], "Website": p.get("website", ""), "LinkedIn": p["linkedin"]}
         if "Instagram" in cols:
             d["Instagram"] = p["instagram"]
-        if "Email" in cols:
-            for k in range(4):
-                d[f"Email {k + 1}"] = p["emails"][k] if k < len(p["emails"]) else ""
-        if "Phone" in cols:
-            d["Mobile"] = p["phones"][0] if p["phones"] else ""
+        for k in range(4):
+            d[f"Email {k + 1}"] = p["emails"][k] if k < len(p["emails"]) else ""
+        d["Mobile"] = p["phones"][0] if p["phones"] else ""
         out.append(d)
     return pd.DataFrame(out)
 
@@ -550,45 +581,38 @@ def get_secret(name):
 
 
 # ============================================================
-# UI  (simple step-by-step wizard for non-technical users)
+# UI  (one simple page)
 # ============================================================
 st.markdown("""
 <style>
 #MainMenu, footer {visibility: hidden;}
 .block-container {max-width: 760px; padding-top: 2rem;}
 div.stButton > button, div.stDownloadButton > button {
-    width: 100%; padding: 0.85rem 1rem; font-size: 1.05rem; border-radius: 12px;
+    width: 100%; padding: 0.85rem 1rem; font-size: 1.1rem; border-radius: 12px;
 }
 .hint {color: #6b7280; font-size: 0.95rem; margin-bottom: 0.8rem;}
 </style>
 """, unsafe_allow_html=True)
 
 FRIENDLY = {
-    "Corporate Communications": "Corporate communications (company comms teams)",
-    "PR / Media": "PR and media (PR managers, press, media relations)",
-    "Marketing": "Marketing (marketing heads, brand, growth, CMO)",
-    "Founder's / CEO Office": "Founder's office / CEO office (chief of staff, interns)",
+    "Corporate Communications": "Corporate communications",
+    "PR / Media": "PR and media",
+    "Marketing": "Marketing and brand",
+    "Founder's / CEO Office": "Founder's office / CEO office",
     "Partnerships / Business Development": "Partnerships and business development",
-    "Corporate Affairs": "Corporate affairs and government relations",
-    "Leadership": "Founders and leadership (CEO, MD, co-founders)",
+    "Corporate Affairs": "Corporate affairs",
+    "Leadership": "Founders and leadership (CEO, MD)",
     "Investor / Corporate Relations": "Investor and corporate relations",
-    "Events / Community": "Events and community (event marketing, community managers)",
+    "Events / Community": "Events and community",
     "Product": "Product managers",
     "HR / Campus Hiring": "HR and campus hiring",
     "VC / Investment Team": "VC investors (Partner, Principal, Senior Associate, Associate)",
-    "VC Analysts & Platform": "VC analysts, investment managers, platform heads",
+    "VC Analysts & Platform": "VC analysts and platform team",
 }
-
-GOALS = [
-    ("🤝", "Company contacts", "For sponsorships, collaborations and corporate relations", "Corporate Relations"),
-    ("🎪", "Events and community people", "Event teams, community managers, brand partnerships", "Events"),
-    ("📰", "PR and media people", "PR managers, communications, press", "PR"),
-    ("📣", "Marketing people", "Marketing heads, brand managers, growth teams", "Marketing"),
-    ("💰", "Investors and VCs", "Partners, principals and associates at VC firms", "VC / Investors"),
-    ("✏️", "Something else", "You choose exactly which jobs you want", "Custom"),
-]
-
-STEP_NAMES = ["What you need", "Companies", "People", "Your database"]
+LABEL_TO_GROUP = {v: k for k, v in FRIENDLY.items()}
+COMPANY_DEFAULT = ["Corporate Communications", "PR / Media", "Marketing", "Founder's / CEO Office",
+                   "Partnerships / Business Development", "Events / Community"]
+VC_DEFAULT = ["VC / Investment Team"]
 
 # Keys live in Streamlit "Secrets", so friends never see or need them.
 api_key = get_secret("LLM_API_KEY") or get_secret("GROQ_API_KEY")
@@ -618,244 +642,121 @@ with st.sidebar:
                 st.error(str(e)[:400])
 
 CFG.update(api_key=api_key, serper=serper, model=model, base_url=base_url)
-
 ss = st.session_state
-ss.setdefault("step", 1)
-ss.setdefault("goal", None)
-ss.setdefault("source", "Find companies for me")
-
-
-def go(n):
-    ss.step = n
-
-
-def pick_goal(goal):
-    ss.goal = goal
-    ss.pop("companies", None)
-    ss.pop("result", None)
-    ss.step = 2
-
-
-def start_over():
-    for k in list(ss.keys()):
-        del ss[k]
-
-
-def details_picker(key, defaults=(False, False, False)):
-    st.markdown("**What details do you need?**")
-    st.checkbox("Name, job title and LinkedIn link (always included)", value=True,
-                disabled=True, key=f"{key}_base")
-    c1, c2, c3 = st.columns(3)
-    ig = c1.checkbox("Instagram", value=defaults[0], key=f"{key}_ig")
-    em = c2.checkbox("Email", value=defaults[1], key=f"{key}_em")
-    ph = c3.checkbox("Mobile", value=defaults[2], key=f"{key}_ph")
-    st.markdown('<div class="hint">We only add emails and phone numbers that are publicly listed. '
-                "If we can't find one, that cell stays empty.</div>", unsafe_allow_html=True)
-    return ig, em, ph
-
-
-def to_cols(ig, em, ph):
-    return [k for k, w in [("Instagram", ig), ("Email", em), ("Phone", ph)] if w]
-
 
 st.title("📇 DB Builder")
-st.progress(ss.step / 4, text=f"Step {ss.step} of 4: {STEP_NAMES[ss.step - 1]}")
+st.markdown('<div class="hint">Type an area or some names. We visit each website and build your '
+            "contact list: name, job title, LinkedIn, email and mobile.</div>", unsafe_allow_html=True)
 
-# ------------------------------------------------------------
-# STEP 1: what do you need?
-# ------------------------------------------------------------
-if ss.step == 1:
-    st.header("What do you want to find?")
-    st.markdown('<div class="hint">Tap the one that fits best. You can change details later.</div>',
-                unsafe_allow_html=True)
-    for i in range(0, len(GOALS), 2):
-        cols2 = st.columns(2)
-        for col, (icon, title, desc, goal) in zip(cols2, GOALS[i:i + 2]):
-            with col:
-                st.button(f"{icon}  {title}", key=f"goal_{goal}", on_click=pick_goal, args=(goal,))
-                st.caption(desc)
+kind = st.radio("What are you looking for?", ["🏢 Companies", "💰 VC funds"], horizontal=True)
+is_vc = "VC" in kind
+entity = "VC firms" if is_vc else "companies"
 
-# ------------------------------------------------------------
-# STEP 2: companies
-# ------------------------------------------------------------
-elif ss.step == 2:
-    goal = ss.goal
-    st.header("Which companies?")
-    st.markdown('<div class="hint">Tell us where to look.</div>', unsafe_allow_html=True)
-    ss.source = st.radio(
-        "How do you want to pick companies?",
-        ["Find companies for me", "I already have a list of companies", "I have names of specific people"],
-        index=["Find companies for me", "I already have a list of companies",
-               "I have names of specific people"].index(ss.source),
-        label_visibility="collapsed")
+how = st.radio("How do you want to start?",
+               ["🔍 Find them for me (type an area)", "📝 I have the names"], horizontal=True)
+find_mode = how.startswith("🔍")
 
-    needs_ai = ss.source != "I already have a list of companies"
-    if needs_ai and not api_key:
-        st.warning("This option needs the app owner to finish setup (open the small arrow at the top-left "
-                   "and use 'Admin setup'). Meanwhile, you can choose 'I already have a list of companies'.")
-
-    # ---- A) find companies for me
-    elif ss.source == "Find companies for me":
-        entity = "VC firms" if goal == "VC / Investors" else "companies"
-        sector = st.text_input(f"What type of {entity}?",
-                               placeholder="Example: fintech, clothing brands, EV startups, early-stage funds")
-        count = st.select_slider("How many?", options=[10, 20, 30, 40, 50], value=20)
-        with st.expander("More options"):
-            region = st.text_input("Country or city", value="India")
-        if st.button("🔍  Find them", type="primary", disabled=not sector.strip()):
-            comps, failed = [], False
-            with st.spinner("Looking for companies. This takes about a minute..."):
-                try:
-                    comps = find_companies(sector.strip(), count, entity, region)
-                except Exception as e:
-                    failed = True
-                    st.error(explain_ai_error(e))
-            df = pd.DataFrame(comps)
-            if failed:
-                pass
-            elif df.empty:
-                st.error("We couldn't find any. Try a simpler or broader type, like 'fintech'.")
-            else:
-                df.insert(0, "Include", True)
-                ss.companies = df
-
-    # ---- B) paste a list
-    elif ss.source == "I already have a list of companies":
-        pasted = st.text_area("Type or paste one company per line", height=170,
-                              placeholder="Zerodha\nRazorpay\nSequoia Capital India")
-        if st.button("✅  Use this list", type="primary", disabled=not pasted.strip()):
-            rows = []
-            for line in pasted.splitlines():
-                if line.strip():
-                    parts = [x.strip() for x in line.split(",")]
-                    rows.append({"Include": True, "company": parts[0],
-                                 "website": parts[1] if len(parts) > 1 else "", "note": ""})
-            ss.companies = pd.DataFrame(rows)
-
-    # ---- C) specific people
-    else:
-        names = st.text_area("Type one person's name per line", height=150,
-                             placeholder="Alia Bhatt\nNandan Nilekani")
-        ig, em, ph = details_picker("ppl")
-        if st.button("🔍  Find these people", type="primary", disabled=not names.strip()):
-            lst = [n.strip() for n in names.splitlines() if n.strip()]
-            found, bar = [], st.progress(0.0, text="Searching...")
-            with ThreadPoolExecutor(2) as ex:
-                for i, f in enumerate(as_completed([ex.submit(lookup_person, n) for n in lst]), 1):
-                    try:
-                        found.append(f.result())
-                    except Exception as e:
-                        st.error(explain_ai_error(e))
-                        st.stop()
-                    bar.progress(i / len(lst), text=f"Done {i} of {len(lst)}")
-            ss.result = build_dataframe(found, to_cols(ig, em, ph))
-            ss.step = 4
-            st.rerun()
-
-    # ---- review list (A and B)
-    if "companies" in ss and ss.source != "I have names of specific people":
-        st.markdown("---")
-        st.subheader("Here's your list")
-        st.markdown('<div class="hint">Untick any company you don\'t want.</div>', unsafe_allow_html=True)
-        ss.companies = st.data_editor(
-            ss.companies, hide_index=True, use_container_width=True,
-            column_order=["Include", "company", "note"],
-            column_config={"Include": st.column_config.CheckboxColumn("Keep"),
-                           "company": st.column_config.TextColumn("Company", disabled=True),
-                           "note": st.column_config.TextColumn("About", disabled=True)})
-        st.button("Next  →", type="primary", on_click=go, args=(3,))
-
-    st.button("←  Back", key="back2", on_click=go, args=(1,))
-
-# ------------------------------------------------------------
-# STEP 3: people + details
-# ------------------------------------------------------------
-elif ss.step == 3:
-    goal = ss.goal
-    st.header("What kind of people?")
-    st.markdown('<div class="hint">We pre-ticked the best ones for you. Tick or untick as you like.</div>',
-                unsafe_allow_html=True)
-
-    if goal == "VC / Investors":
-        st.info("For VC firms we also read the firm's own website (team, about and contact pages) "
-                "to pick up names, emails and phone numbers.")
-    recommended = PRESETS[goal]
-    others = [g for g in ROLE_GROUPS if g not in recommended]
-    chosen = []
-    for g in recommended:
-        if st.checkbox(FRIENDLY[g], value=True, key=f"g_{goal}_{g}"):
-            chosen.append(g)
-    with st.expander("More job types"):
-        for g in others:
-            if st.checkbox(FRIENDLY[g], value=False, key=f"g_{goal}_{g}"):
-                chosen.append(g)
-
-    extra = st.text_input("Don't see the job you want? Type it here",
-                          placeholder="Example: Sponsorship Manager, Fund Manager (separate with commas)")
-    st.markdown("---")
-    is_vc = goal == "VC / Investors"
-    ig, em, ph = details_picker(f"co_{goal}", (False, is_vc, is_vc))
-    st.markdown("---")
-    per_co = st.radio("How many people per company?", [3, 5, 10], index=1, horizontal=True)
-
-    with st.expander("More options"):
-        broad = st.checkbox("Search more widely (finds more people, but some may be less relevant)")
-        use_company_level = st.checkbox(
-            "If a person's own email or phone isn't found, use the company's general one "
-            "(like info@ or press@)", value=True)
-
-    groups = {g: ROLE_GROUPS[g] for g in chosen}
-    custom = [x.strip() for x in extra.split(",") if x.strip()]
-    if custom:
-        groups["Custom"] = custom
-        for x in custom:
-            ROLE_PRIORITY.setdefault(x, 80)
-
-    todo = [r for _, r in ss.companies[ss.companies["Include"]].iterrows()]
-    st.info(f"Ready to search {len(todo)} companies. This can take 1 to 5 minutes. "
-            "Please keep this page open.")
-
-    if st.button("🚀  Build my database", type="primary", disabled=not groups or not todo):
-        results, bar = {}, st.progress(0.0, text="Starting...")
-        workers = 4 if serper else 2
-        with ThreadPoolExecutor(workers) as ex:
-            futs = {ex.submit(process_company, r, groups, per_co, broad, ig, em or ph,
-                              use_company_level, goal == "VC / Investors"): i for i, r in enumerate(todo)}
-            for n, f in enumerate(as_completed(futs), 1):
-                i = futs[f]
-                try:
-                    results[i] = f.result()
-                except Exception:
-                    results[i] = []
-                bar.progress(n / len(futs), text=f"Done {n} of {len(futs)}: {todo[i]['company']}")
-        ordered = [p for i in sorted(results) for p in results[i]]
-        ss.result = build_dataframe(ordered, to_cols(ig, em, ph))
-        ss.step = 4
-        st.rerun()
-
-    st.button("←  Back", key="back3", on_click=go, args=(2,))
-
-# ------------------------------------------------------------
-# STEP 4: result
-# ------------------------------------------------------------
+area, names, count = "", "", 20
+if find_mode:
+    area = st.text_input(f"Which area?", placeholder="Example: fintech, EV startups, clothing brands, early-stage")
+    count = st.select_slider(f"How many {entity}?", options=[10, 20, 30, 40, 50], value=20)
+    if not api_key:
+        st.warning("Searching by area needs the app owner to finish setup (small arrow at the top-left, "
+                   "'Admin setup'). Meanwhile choose 'I have the names'.")
 else:
-    res = ss.get("result")
-    if res is None or res.empty:
-        st.header("We couldn't find anyone this time")
-        st.markdown("Try one of these:")
-        st.markdown("- Tick **Search more widely** in More options\n"
-                    "- Pick more job types\n"
-                    "- Try a different or bigger list of companies")
-        st.button("←  Change my choices", on_click=go, args=(3 if ss.get("companies") is not None else 2,))
+    names = st.text_area(f"Type one {'VC fund' if is_vc else 'company'} per line", height=150,
+                         placeholder="Zerodha\nRazorpay\nSequoia Capital India" if not is_vc
+                         else "Blume Ventures\nAccel India\nPeak XV Partners")
+
+with st.expander("More options (optional)"):
+    default_groups = VC_DEFAULT if is_vc else COMPANY_DEFAULT
+    picked = st.multiselect("Which job types do you want?", list(LABEL_TO_GROUP),
+                            default=[FRIENDLY[g] for g in default_groups], key=f"jobs_{is_vc}")
+    extra = st.text_input("Another job title? (separate with commas)",
+                          placeholder="Example: Sponsorship Manager, Fund Manager")
+    per_co = st.slider("Most people to keep per company", 3, 20, 10 if is_vc else 5, key=f"per_{is_vc}")
+    region = st.text_input("Country or city", value="India")
+    want_ig = st.checkbox("Also find Instagram IDs (slower)")
+    use_company_level = st.checkbox("If a person's own email or mobile isn't listed, use the company's "
+                                    "general one (like info@ or the main number)", value=True)
+    broad = st.checkbox("Search more widely (more people, some less relevant)")
+
+groups = {LABEL_TO_GROUP[p]: ROLE_GROUPS[LABEL_TO_GROUP[p]] for p in picked}
+custom = [x.strip() for x in extra.split(",") if x.strip()]
+if custom:
+    groups["Custom"] = custom
+    for x in custom:
+        ROLE_PRIORITY.setdefault(x, 80)
+
+ready = bool(groups) and ((find_mode and area.strip() and api_key) or (not find_mode and names.strip()))
+go_clicked = st.button("🚀  Build my database", type="primary", disabled=not ready)
+
+if go_clicked:
+    bar = st.progress(0.0, text="Starting...")
+    rows = []
+    if find_mode:
+        bar.progress(0.03, text=f"Finding {entity} in '{area.strip()}'...")
+        try:
+            for c in find_companies(area.strip(), count, entity, region):
+                if isinstance(c, dict) and c.get("company"):
+                    rows.append({"company": c["company"], "website": c.get("website", "") or ""})
+        except Exception as e:
+            bar.empty()
+            st.error(explain_ai_error(e))
+            st.stop()
     else:
-        n_co = res["Company"].replace("", pd.NA).nunique()
-        st.success(f"Done! We found {len(res)} people from {n_co} companies.")
+        for line in names.splitlines():
+            if line.strip():
+                parts = [x.strip() for x in line.split(",")]
+                rows.append({"company": parts[0], "website": parts[1] if len(parts) > 1 else ""})
+    # remove duplicates, keep order
+    seen, todo = set(), []
+    for r in rows:
+        k = r["company"].lower()
+        if k not in seen:
+            seen.add(k)
+            todo.append(r)
+    todo = todo[:60]
+
+    if not todo:
+        bar.empty()
+        st.error("We couldn't find any. Try a simpler area (like 'fintech') or type the names yourself.")
+        st.stop()
+
+    results, workers = {}, (4 if serper else 2)
+    with ThreadPoolExecutor(workers) as ex:
+        futs = {ex.submit(process_company, r, groups, per_co, broad, want_ig, use_company_level): i
+                for i, r in enumerate(todo)}
+        for n, f in enumerate(as_completed(futs), 1):
+            i = futs[f]
+            try:
+                results[i] = f.result()
+            except Exception:
+                results[i] = []
+            bar.progress(n / len(futs), text=f"Reading websites: {n} of {len(todo)} done ({todo[i]['company']})")
+    bar.empty()
+    ordered = [p for i in sorted(results) for p in results[i]]
+    ss.result = build_dataframe(ordered, ["Instagram"] if want_ig else [])
+    ss.empty = [todo[i]["company"] for i in sorted(results) if not results[i]]
+    ss.total = len(todo)
+
+# ------------------------------------------------------------
+# Results
+# ------------------------------------------------------------
+if "result" in ss:
+    res = ss.result
+    st.markdown("---")
+    if res.empty:
+        st.warning("We couldn't find anyone this time. Try 'Search more widely' in More options, "
+                   "pick more job types, or add a Serper key.")
+    else:
+        st.success(f"Done! Found {len(res)} people from {ss.total - len(ss.empty)} of {ss.total} "
+                   f"{'VC funds' if is_vc else 'companies'}.")
         st.download_button("⬇️  Download my database (CSV, opens in Excel)",
-                           res.to_csv(index=False).encode("utf-8-sig"),
-                           "database.csv", "text/csv", type="primary")
+                           res.to_csv(index=False).encode("utf-8-sig"), "database.csv", "text/csv",
+                           type="primary")
         st.dataframe(res, use_container_width=True, hide_index=True)
-        st.caption("Empty cells mean that detail isn't publicly available. "
-                   "Please double-check important contacts before reaching out.")
-        if ss.get("companies") is not None:
-            st.button("←  Change job types or details", on_click=go, args=(3,))
-    st.button("🔄  Start a new database", key="restart", on_click=start_over)
+        st.caption("Empty cells mean that detail isn't publicly listed. Please double-check important "
+                   "contacts before reaching out.")
+    if ss.get("empty"):
+        st.info("No people found for: " + ", ".join(ss.empty[:30]))
