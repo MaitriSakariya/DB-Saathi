@@ -298,11 +298,19 @@ def process_company(row, groups, per_co, broad, want_ig, want_contact, use_compa
 # LLM (only used for: sector -> companies, and specific-person lookup)
 # ============================================================
 def llm(prompt, max_tokens=3000):
-    import anthropic
-    client = anthropic.Anthropic(api_key=CFG["api_key"])
-    msg = client.messages.create(model=CFG["model"], max_tokens=max_tokens,
-                                 messages=[{"role": "user", "content": prompt}])
-    return "".join(b.text for b in msg.content if b.type == "text")
+    """Works with any OpenAI-compatible API. Default: Groq (free)."""
+    url = CFG["base_url"].rstrip("/") + "/chat/completions"
+    headers = {"Authorization": f"Bearer {CFG['api_key']}", "Content-Type": "application/json"}
+    body = {"model": CFG["model"], "max_tokens": max_tokens, "temperature": 0.1,
+            "messages": [{"role": "user", "content": prompt}]}
+    for attempt in range(4):
+        r = requests.post(url, headers=headers, json=body, timeout=60)
+        if r.status_code == 429:  # free-tier rate limit: wait and retry
+            time.sleep(min(float(r.headers.get("retry-after", 5 * (attempt + 1))), 30))
+            continue
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"] or ""
+    return ""
 
 
 def parse_json(text):
@@ -331,7 +339,7 @@ def find_companies(sector, n, entity, region):
 No duplicates. Do not invent companies that are not supported by the results.
 
 RESULTS:
-{blob[:14000]}"""
+{blob[:9000]}"""
     return parse_json(llm(prompt))
 
 
@@ -343,7 +351,7 @@ Return ONLY a JSON array with ONE object with keys: "name", "designation", "comp
 Use "" when unknown. Never guess.
 
 SOURCES:
-{blob[:9000]}"""
+{blob[:8000]}"""
     res = parse_json(llm(prompt, 1000))
     p = res[0] if res and isinstance(res[0], dict) else {"name": name}
     li = p.get("linkedin", "") if p.get("linkedin", "") in blob else ""
@@ -421,17 +429,19 @@ GOALS = [
 STEP_NAMES = ["What you need", "Companies", "People", "Your database"]
 
 # Keys live in Streamlit "Secrets", so friends never see or need them.
-api_key = get_secret("ANTHROPIC_API_KEY")
+api_key = get_secret("LLM_API_KEY") or get_secret("GROQ_API_KEY")
 serper = get_secret("SERPER_API_KEY")
-model = get_secret("MODEL") or "claude-haiku-5-5"
+base_url = get_secret("LLM_BASE_URL") or "https://api.groq.com/openai/v1"
+model = get_secret("LLM_MODEL") or "llama-3.3-70b-versatile"
 
 with st.sidebar:
     with st.expander("Admin setup (only for the app owner)"):
-        api_key = st.text_input("Anthropic API key", type="password", value=api_key)
+        api_key = st.text_input("Groq API key (free, from console.groq.com)", type="password", value=api_key)
         serper = st.text_input("Serper API key (optional)", type="password", value=serper)
         model = st.text_input("Model", value=model)
+        base_url = st.text_input("API base URL (change only to use another provider)", value=base_url)
 
-CFG.update(api_key=api_key, serper=serper, model=model)
+CFG.update(api_key=api_key, serper=serper, model=model, base_url=base_url)
 
 ss = st.session_state
 ss.setdefault("step", 1)
