@@ -56,8 +56,9 @@ ROLE_GROUPS = {
         "Talent Acquisition", "Human Resources", "HR Manager", "HR Head", "Recruiter"],
     "VC / Investment Team": [
         "Managing Partner", "General Partner", "Venture Partner", "Partner",
-        "Principal", "Associate", "Analyst", "Investment Manager", "Platform Head",
-        "Venture Capital", "Investments"],
+        "Principal", "Senior Associate", "Associate"],
+    "VC Analysts & Platform": [
+        "Analyst", "Investment Manager", "Platform Head", "Platform Lead"],
 }
 
 ROLE_PRIORITY = {
@@ -81,7 +82,8 @@ ROLE_PRIORITY = {
     "Events": 60, "Event Marketing": 65, "Community": 55, "Community Manager": 60,
     # new
     "Managing Partner": 95, "General Partner": 93, "Venture Partner": 85, "Partner": 90,
-    "Principal": 85, "Associate": 75, "Analyst": 65, "Investment Manager": 78,
+    "Principal": 85, "Senior Associate": 80, "Associate": 75, "Analyst": 65,
+    "Investment Manager": 78, "Platform Lead": 75,
     "Platform Head": 78,
     "Chief Product Officer": 88, "Head of Product": 85, "Product Lead": 78,
     "Product Manager": 75, "Product Management": 72, "Associate Product Manager": 65,
@@ -97,7 +99,7 @@ PRESETS = {
     "Events": ["Events / Community", "Marketing", "Partnerships / Business Development"],
     "PR": ["PR / Media", "Corporate Communications", "Marketing"],
     "Marketing": ["Marketing", "Events / Community", "PR / Media"],
-    "VC / Investors": ["VC / Investment Team", "Leadership"],
+    "VC / Investors": ["VC / Investment Team"],
     "Custom": ["Leadership"],
 }
 
@@ -279,15 +281,157 @@ def find_instagram(name, company):
     return ""
 
 
-def process_company(row, groups, per_co, broad, want_ig, want_contact, use_company_level):
+TEAM_PATHS = ("", "/team", "/our-team", "/people", "/about", "/about-us", "/who-we-are",
+              "/partners", "/contact", "/contact-us")
+ROLE_WORDS = re.compile(r"\b(partner|principal|associate|analyst|founder|co-founder|managing|director|"
+                        r"vice president|vp|investor|investments?|head|platform|ceo|cio|cfo|coo|chief|"
+                        r"venture|manager|advisor|operating|president)\b", re.I)
+NAME_RE = re.compile(r"^[A-Z][A-Za-z.'’-]+(?:\s+[A-Z][A-Za-z.'’-]+){1,3}$")
+NOT_NAMES = {"team", "about", "contact", "us", "read", "more", "view", "profile", "privacy", "policy",
+             "terms", "portfolio", "news", "blog", "careers", "home", "linkedin", "twitter", "our",
+             "meet", "get", "touch", "partners", "investors", "advisors", "follow", "email", "view"}
+
+
+def name_key(n):
+    return re.sub(r"[^a-z ]", "", (n or "").lower()).strip()
+
+
+def add_person(found, company, name, title="", linkedin="", email="", phone=""):
+    name = normalize_text(name)
+    if not NAME_RE.match(name) or any(w.lower() in NOT_NAMES for w in name.split()):
+        return
+    p = found.setdefault(name_key(name), {
+        "company": company, "name": name, "linkedin": "", "title": "", "category": "", "role": "",
+        "score": 0, "instagram": "", "emails": [], "phones": []})
+    p["title"] = p["title"] or normalize_text(title)
+    p["linkedin"] = p["linkedin"] or clean_url(linkedin)
+    if email and email.lower() not in p["emails"]:
+        p["emails"].append(email.lower())
+    if phone and phone not in p["phones"]:
+        p["phones"].append(phone)
+
+
+def cards_from_soup(soup, company, found):
+    """Team pages usually show each person in a 'card' with a LinkedIn / email link. Read those cards."""
+    for a in soup.select('a[href*="linkedin.com/in/"], a[href^="mailto:"]'):
+        href = a["href"]
+        node = a
+        for _ in range(6):
+            node = node.parent
+            if node is None or len(node.select('a[href*="linkedin.com/in/"]')) > 1:
+                break
+            lines = [normalize_text(t) for t in node.get_text("\n").split("\n")]
+            lines = [x for x in lines if x]
+            name = next((x for x in lines if len(x) < 40 and NAME_RE.match(x)
+                         and not any(w.lower() in NOT_NAMES for w in x.split())), "")
+            if name:
+                role = next((x for x in lines if x != name and len(x) < 80 and ROLE_WORDS.search(x)), "")
+                if "linkedin.com/in/" in href:
+                    add_person(found, company, name, role, linkedin=href)
+                else:
+                    add_person(found, company, name, role, email=href[7:].split("?")[0])
+                break
+
+
+def scrape_team(site, company, groups, broad):
+    """Read a firm's own website: team pages -> people, emails, phones."""
+    if not site.startswith("http"):
+        site = "https://" + site
+    site = site.rstrip("/")
+    found, emails, phones, texts, links, seen = {}, [], [], [], [], set()
+    for path in TEAM_PATHS:
+        try:
+            r = requests.get(site + path, headers=UA, timeout=8)
+            if r.status_code != 200 or "text/html" not in r.headers.get("content-type", "") \
+                    or r.url in seen:
+                continue
+            seen.add(r.url)
+            soup = BeautifulSoup(r.text, "html.parser")
+        except Exception:
+            continue
+        for t in soup(["script", "style", "noscript"]):
+            t.decompose()
+        for a in soup.select('a[href^="mailto:"]'):
+            emails.append(a["href"][7:].split("?")[0].strip())
+        for a in soup.select('a[href^="tel:"]'):
+            phones.append(a["href"][4:].strip())
+        for a in soup.select('a[href*="linkedin.com/in/"], a[href^="mailto:"], a[href^="tel:"]'):
+            links.append(f"{normalize_text(a.get_text())[:40]} -> {a['href'].split('?')[0]}")
+        cards_from_soup(soup, company, found)
+        text = " ".join(soup.get_text(" ").split())
+        texts.append(text[:3000])
+        emails += EMAIL_RE.findall(text)
+        phones += PHONE_RE.findall(text)
+
+    # AI reads the page text too (optional; if the AI fails we still keep what we found above)
+    if CFG.get("api_key") and texts:
+        blob = "\n".join(texts)[:6500] + "\nLINKS:\n" + "\n".join(dict.fromkeys(links))[:2500]
+        prompt = f"""Below is text and links from the website of "{company}". List the team members
+(partners, principals, associates, analysts, founders, staff). Return ONLY a JSON array of objects with keys
+"name", "designation", "email", "phone", "linkedin". Use ONLY what is explicitly present in the text or links.
+Use "" if unknown. Never guess emails or phone numbers.
+
+{blob}"""
+        try:
+            low = blob.lower()
+            for p in parse_json(llm(prompt, 2500)):
+                if not isinstance(p, dict) or not p.get("name") or name_key(p["name"]) not in name_key(low):
+                    continue
+                em = p.get("email", "") if p.get("email", "").lower() in low else ""
+                li = p.get("linkedin", "") if p.get("linkedin", "").split("?")[0].lower() in low else ""
+                add_person(found, company, p["name"], p.get("designation", ""), li, em, "")
+        except Exception:
+            pass
+
+    bad = (".png", ".jpg", ".jpeg", ".svg", ".gif", ".webp", "sentry", "wixpress", "example.")
+    emails = [e for e in dict.fromkeys(x.lower() for x in emails) if not any(b in e for b in bad)]
+    phones = list(dict.fromkeys(re.sub(r"\s+", " ", p).strip() for p in phones))
+
+    people = []
+    for p in found.values():
+        cat, role, prio = classify_person(p["title"], groups)
+        if cat or broad or not p["title"]:
+            p["category"], p["role"], p["score"] = cat, role, 100 + prio
+            people.append(p)
+    return people, emails, phones
+
+
+def merge_people(web, searched):
+    out = list(web)
+    for f in searched:
+        fk = name_key(f["name"]).split()
+        if not fk:
+            continue
+        match = None
+        for w in out:
+            wk = name_key(w["name"]).split()
+            if wk and wk[0] == fk[0] and wk[-1] == fk[-1]:
+                match = w
+                break
+        if match:
+            match["linkedin"] = match["linkedin"] or f["linkedin"]
+            match["title"] = match["title"] or f["title"]
+        else:
+            out.append(f)
+    return out
+
+
+def process_company(row, groups, per_co, broad, want_ig, want_contact, use_company_level, is_vc=False):
     company = row["company"]
-    people = rank_people(search_company(company, groups, broad), per_co)
-    if want_contact and people:
-        site = row.get("website") or guess_website(company)
+    site = row.get("website") or (guess_website(company) if (want_contact or is_vc) else "")
+    web_people, emails, phones = [], [], []
+    if site and is_vc:
+        web_people, emails, phones = scrape_team(site, company, groups, broad)
+    elif site and want_contact:
         emails, phones = site_contacts(site)
+    searched = rank_people(search_company(company, groups, broad), per_co)
+    people = merge_people(web_people[:30], searched)
+    if want_contact:
         for p in people:
-            p["emails"] = assign_emails(p["name"], emails, use_company_level)
-            p["phones"] = phones[:1] if use_company_level else []
+            if not p["emails"]:
+                p["emails"] = assign_emails(p["name"], emails, use_company_level)
+            if not p["phones"] and use_company_level:
+                p["phones"] = phones[:1]
     if want_ig:
         for p in people:
             p["instagram"] = find_instagram(p["name"], company)
@@ -393,7 +537,7 @@ def build_dataframe(people, cols):
             for k in range(4):
                 d[f"Email {k + 1}"] = p["emails"][k] if k < len(p["emails"]) else ""
         if "Phone" in cols:
-            d["Phone"] = p["phones"][0] if p["phones"] else ""
+            d["Mobile"] = p["phones"][0] if p["phones"] else ""
         out.append(d)
     return pd.DataFrame(out)
 
@@ -431,7 +575,8 @@ FRIENDLY = {
     "Events / Community": "Events and community (event marketing, community managers)",
     "Product": "Product managers",
     "HR / Campus Hiring": "HR and campus hiring",
-    "VC / Investment Team": "VC team (partners, principals, associates, analysts)",
+    "VC / Investment Team": "VC investors (Partner, Principal, Senior Associate, Associate)",
+    "VC Analysts & Platform": "VC analysts, investment managers, platform heads",
 }
 
 GOALS = [
@@ -457,6 +602,20 @@ with st.sidebar:
         serper = st.text_input("Serper API key (optional)", type="password", value=serper)
         model = st.text_input("Model", value=model)
         base_url = st.text_input("API base URL (change only to use another provider)", value=base_url)
+        if st.button("Test AI connection"):
+            CFG.update(api_key=api_key, serper=serper, model=model, base_url=base_url)
+            try:
+                r = requests.get(base_url.rstrip("/") + "/models",
+                                 headers={"Authorization": f"Bearer {api_key.strip()}"}, timeout=20)
+                st.write(f"Key check: HTTP {r.status_code}")
+                if r.ok:
+                    ids = [m.get("id", "") for m in r.json().get("data", [])]
+                    st.write("Model found: " + ("yes" if model in ids else "NO. Try one of: " + ", ".join(ids[:12])))
+                    st.success("AI replied: " + llm("Reply with the single word OK", 5))
+                else:
+                    st.code(r.text[:400])
+            except Exception as e:
+                st.error(str(e)[:400])
 
 CFG.update(api_key=api_key, serper=serper, model=model, base_url=base_url)
 
@@ -482,14 +641,14 @@ def start_over():
         del ss[k]
 
 
-def details_picker(key):
+def details_picker(key, defaults=(False, False, False)):
     st.markdown("**What details do you need?**")
     st.checkbox("Name, job title and LinkedIn link (always included)", value=True,
                 disabled=True, key=f"{key}_base")
     c1, c2, c3 = st.columns(3)
-    ig = c1.checkbox("Instagram", key=f"{key}_ig")
-    em = c2.checkbox("Email", key=f"{key}_em")
-    ph = c3.checkbox("Phone", key=f"{key}_ph")
+    ig = c1.checkbox("Instagram", value=defaults[0], key=f"{key}_ig")
+    em = c2.checkbox("Email", value=defaults[1], key=f"{key}_em")
+    ph = c3.checkbox("Mobile", value=defaults[2], key=f"{key}_ph")
     st.markdown('<div class="hint">We only add emails and phone numbers that are publicly listed. '
                 "If we can't find one, that cell stays empty.</div>", unsafe_allow_html=True)
     return ig, em, ph
@@ -617,6 +776,9 @@ elif ss.step == 3:
     st.markdown('<div class="hint">We pre-ticked the best ones for you. Tick or untick as you like.</div>',
                 unsafe_allow_html=True)
 
+    if goal == "VC / Investors":
+        st.info("For VC firms we also read the firm's own website (team, about and contact pages) "
+                "to pick up names, emails and phone numbers.")
     recommended = PRESETS[goal]
     others = [g for g in ROLE_GROUPS if g not in recommended]
     chosen = []
@@ -631,7 +793,8 @@ elif ss.step == 3:
     extra = st.text_input("Don't see the job you want? Type it here",
                           placeholder="Example: Sponsorship Manager, Fund Manager (separate with commas)")
     st.markdown("---")
-    ig, em, ph = details_picker("co")
+    is_vc = goal == "VC / Investors"
+    ig, em, ph = details_picker(f"co_{goal}", (False, is_vc, is_vc))
     st.markdown("---")
     per_co = st.radio("How many people per company?", [3, 5, 10], index=1, horizontal=True)
 
@@ -657,7 +820,7 @@ elif ss.step == 3:
         workers = 4 if serper else 2
         with ThreadPoolExecutor(workers) as ex:
             futs = {ex.submit(process_company, r, groups, per_co, broad, ig, em or ph,
-                              use_company_level): i for i, r in enumerate(todo)}
+                              use_company_level, goal == "VC / Investors"): i for i, r in enumerate(todo)}
             for n, f in enumerate(as_completed(futs), 1):
                 i = futs[f]
                 try:
