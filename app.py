@@ -10,7 +10,7 @@ import requests
 import streamlit as st
 from bs4 import BeautifulSoup
 
-st.set_page_config(page_title="DB Builder", page_icon="📇", layout="centered", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="DB Builder", page_icon="📇", layout="wide", initial_sidebar_state="expanded")
 
 # ============================================================
 # ROLE GROUPS  (your original groups + a few new ones)
@@ -768,58 +768,43 @@ TICKED = {
 
 st.markdown("""
 <style>
-#MainMenu, footer, header[data-testid="stHeader"] {visibility: hidden; height: 0;}
-.block-container {max-width: 820px; padding-top: 1.2rem; padding-bottom: 4rem;}
+/* hide every Streamlit owner/admin control from visitors */
+#MainMenu, footer, [data-testid="stToolbar"], [data-testid="stDecoration"], [data-testid="stStatusWidget"],
+.stAppDeployButton, [data-testid="stAppDeployButton"], [class*="viewerBadge"], [data-testid="manage-app-button"],
+[class*="StatusWidget"] {display: none !important; visibility: hidden !important;}
+header[data-testid="stHeader"] {background: transparent;}
+.block-container {max-width: 100%; padding: 0.8rem 1.6rem 0.5rem;}
 div[data-testid="InputInstructions"] {display: none;}
-.hero {background: linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%); color: #fff;
-       padding: 1.4rem 1.6rem; border-radius: 18px; margin-bottom: 1.2rem;}
-.hero h1 {margin: 0; font-size: 1.7rem; color: #fff; padding: 0;}
-.hero p {margin: .3rem 0 0; opacity: .9; font-size: .98rem;}
-.step {display: flex; align-items: center; gap: .6rem; margin: 1.4rem 0 .5rem;
-       font-weight: 700; font-size: 1.12rem;}
-.step span {background: #4f46e5; color: #fff; width: 1.7rem; height: 1.7rem; border-radius: 50%;
-            display: inline-flex; align-items: center; justify-content: center; font-size: .9rem;}
-.hint {color: #6b7280; font-size: .9rem; margin: -.2rem 0 .5rem;}
+@media (min-width: 992px) {
+  [data-testid="stSidebar"] {min-width: 370px !important; max-width: 370px !important;}
+  [data-testid="stSidebarCollapseButton"], [data-testid="stSidebarCollapsedControl"] {display: none !important;}
+}
+[data-testid="stSidebar"] [data-testid="stSidebarHeader"] {display: none;}
+[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] {padding-top: 0.6rem;}
+[data-testid="stSidebar"] [data-testid="stVerticalBlock"] {gap: 0.55rem;}
+[data-testid="stSidebar"] label p {font-size: 0.86rem; font-weight: 600;}
+.brand {font-size: 1.35rem; font-weight: 800; margin: 0;}
+.hint {color: #6b7280; font-size: .8rem; margin: -.3rem 0 0;}
 div.stButton > button, div.stDownloadButton > button {
-    width: 100%; padding: .8rem 1rem; font-size: 1.08rem; border-radius: 12px; font-weight: 600;}
-div[role="radiogroup"] {gap: .6rem;}
-div[role="radiogroup"] label {border: 1.5px solid #d1d5db; border-radius: 12px; padding: .5rem 1.1rem;
+    width: 100%; padding: .65rem 1rem; font-size: 1.02rem; border-radius: 12px; font-weight: 700;}
+div[role="radiogroup"] label {border: 1.5px solid #d1d5db; border-radius: 12px; padding: .35rem .9rem;
                               background: rgba(127,127,127,.06);}
 div[role="radiogroup"] label:has(input:checked) {border-color: #4f46e5; background: rgba(79,70,229,.14);}
-.stat {border: 1px solid rgba(127,127,127,.3); border-radius: 14px; padding: .8rem 1rem; text-align: center;}
-.stat b {display: block; font-size: 1.6rem; color: #4f46e5;}
+.stat {border: 1px solid rgba(127,127,127,.3); border-radius: 14px; padding: .55rem .8rem; text-align: center;}
+.stat b {display: block; font-size: 1.45rem; color: #4f46e5; line-height: 1.2;}
 .stat small {color: #6b7280;}
+.empty {border: 2px dashed rgba(127,127,127,.35); border-radius: 18px; padding: 3rem 1.5rem;
+        text-align: center; color: #6b7280; margin-top: 1rem;}
+.empty h3 {color: inherit; margin: 0 0 .4rem;}
 </style>
 """, unsafe_allow_html=True)
 
-api_key = get_secret("LLM_API_KEY") or get_secret("GROQ_API_KEY")
-serper = get_secret("SERPER_API_KEY")
-base_url = get_secret("LLM_BASE_URL") or "https://api.groq.com/openai/v1"
-model = get_secret("LLM_MODEL") or "llama-3.3-70b-versatile"
-
-with st.sidebar:
-    with st.expander("Admin setup (only for the app owner, all optional)"):
-        api_key = st.text_input("Groq API key (optional, helps read tricky websites)", type="password",
-                                value=api_key)
-        serper = st.text_input("Serper API key (optional, better search)", type="password", value=serper)
-        model = st.text_input("Model", value=model)
-        base_url = st.text_input("API base URL", value=base_url)
-        if st.button("Test AI connection"):
-            CFG.update(api_key=api_key, serper=serper, model=model, base_url=base_url)
-            try:
-                r = requests.get(base_url.rstrip("/") + "/models",
-                                 headers={"Authorization": f"Bearer {api_key.strip()}"}, timeout=20)
-                st.write(f"Key check: HTTP {r.status_code}")
-                if r.ok:
-                    st.success("AI replied: " + llm("Reply with the single word OK", 5))
-                else:
-                    st.code(r.text[:400])
-            except Exception as e:
-                st.error(str(e)[:400])
-
-CFG.update(api_key=api_key, serper=serper, model=model, base_url=base_url)
+# Keys come ONLY from Streamlit Secrets (nothing is shown to visitors).
+CFG.update(api_key=get_secret("LLM_API_KEY") or get_secret("GROQ_API_KEY"),
+           serper=get_secret("SERPER_API_KEY"),
+           model=get_secret("LLM_MODEL") or "llama-3.3-70b-versatile",
+           base_url=get_secret("LLM_BASE_URL") or "https://api.groq.com/openai/v1")
 ss = st.session_state
-
 
 URL_END = re.compile(r"[\s|]+((?:https?://)?(?:www\.)?[\w-]+(?:\.[\w-]+)*\.[a-z]{2,}(?:/\S*)?)\s*$", re.I)
 
@@ -836,94 +821,76 @@ def parse_names(text):
         elif re.fullmatch(r"(?:https?://)?(?:www\.)?[\w-]+(?:\.[\w-]+)*\.[a-z]{2,}(?:/\S*)?", part, re.I):
             url, name = part, ""
         if url and not name:
-            name = urlparse(url if url.startswith("http") else "https://" + url).netloc.replace("www.", "").split(".")[0].title()
+            name = urlparse(url if url.startswith("http") else "https://" + url).netloc \
+                .replace("www.", "").split(".")[0].title()
         if name and name.lower() not in seen:
             seen.add(name.lower())
             out.append({"name": name, "url": url})
     return out
 
 
-def set_all(kind, value):
-    for label in JOBS[kind]:
-        ss[f"job_{kind}_{label}"] = value
+def pick_all(kind):
+    ss[f"jobs_{kind}"] = list(JOBS[kind]) if ss.get(f"allj_{kind}") else list(TICKED[kind])
 
 
-def show_table(df):
+def show_table(df, height):
     try:
-        st.dataframe(df, hide_index=True, width="stretch")
+        st.dataframe(df, hide_index=True, width="stretch", height=height)
     except TypeError:
-        st.dataframe(df, hide_index=True, use_container_width=True)
+        st.dataframe(df, hide_index=True, use_container_width=True, height=height)
 
 
-st.markdown('<div class="hero"><h1>📇 DB Builder</h1>'
-            "<p>Give names. Pick job titles. Get a ready CSV with LinkedIn, email and phone.</p></div>",
-            unsafe_allow_html=True)
+# ======================= SIDE PANEL = ALL INPUTS =======================
+with st.sidebar:
+    st.markdown('<p class="brand">📇 DB Builder</p>', unsafe_allow_html=True)
+    choice = st.radio("Type", ["🏢 Company", "💰 VC fund"], horizontal=True, label_visibility="collapsed")
+    kind = "Company" if "Company" in choice else "VC fund"
 
-# ---------------- 1. Company or VC ----------------
-st.markdown('<div class="step"><span>1</span> What do you want to find?</div>', unsafe_allow_html=True)
-choice = st.radio("Type", ["🏢 Company", "💰 VC fund"], horizontal=True, label_visibility="collapsed")
-kind = "Company" if "Company" in choice else "VC fund"
+    txt = st.text_area(f"{kind} names", height=105, key=f"names_{kind}",
+                       placeholder="Blume Ventures | blume.vc\nAccel India\nPeak XV Partners" if kind == "VC fund"
+                       else "Zerodha\nRazorpay | razorpay.com\nSwiggy")
+    names = parse_names(txt)[:60]
+    st.markdown(f'<div class="hint">{len(names)} {kind}(s). One per line or commas. '
+                'Website optional: Name | site.com</div>', unsafe_allow_html=True)
 
-# ---------------- 2. Names ----------------
-st.markdown(f'<div class="step"><span>2</span> Which {kind}s?</div>', unsafe_allow_html=True)
-st.markdown('<div class="hint">One per line, or separated by commas. Max 60. Know the website? Add it '
-            'after the name, like <b>Blume Ventures | blume.vc</b>. Otherwise it is found automatically.</div>',
-            unsafe_allow_html=True)
-txt = st.text_area("Names", height=150, key=f"names_{kind}", label_visibility="collapsed",
-                   placeholder="Blume Ventures\nAccel India\nPeak XV Partners" if kind == "VC fund"
-                   else "Zerodha\nRazorpay\nSwiggy")
-names = parse_names(txt)[:60]
-if names:
-    st.caption(f"{len(names)} {kind}(s) ready")
+    ss.setdefault(f"jobs_{kind}", list(TICKED[kind]))
+    st.multiselect("Job titles", list(JOBS[kind]), key=f"jobs_{kind}")
+    st.checkbox("Select all job titles", key=f"allj_{kind}", on_change=pick_all, args=(kind,))
+    extra = st.text_input("Other job title (Enter; commas for several)", key=f"extra_{kind}",
+                          placeholder="Sponsorship Manager, Fund Manager")
 
-# ---------------- 3. Job titles ----------------
-st.markdown('<div class="step"><span>3</span> Which job titles?</div>', unsafe_allow_html=True)
-b1, b2, _ = st.columns([1, 1, 3])
-b1.button("Select all", key=f"all_{kind}", on_click=set_all, args=(kind, True))
-b2.button("Clear", key=f"none_{kind}", on_click=set_all, args=(kind, False))
+    c1, c2 = st.columns(2)
+    want_mobile = c1.checkbox("Mobile number", value=True)
+    all_people = c2.checkbox("All people", value=False, key=f"all_people_{kind}",
+                             help="No limit on people per firm")
+    per_co = st.slider(f"Most people per {kind.lower()}", 3, 30, 10 if kind == "VC fund" else 8,
+                       key=f"per_{kind}", disabled=all_people)
+    if all_people:
+        per_co = 500
+    with st.expander("More options"):
+        use_company_level = st.checkbox("Use general email / phone from the website if a person's own "
+                                        "isn't listed", value=True)
+        broad = st.checkbox("Search more widely (more people, some less relevant)")
 
-chosen = []
-cols = st.columns(2)
-for i, label in enumerate(JOBS[kind]):
-    with cols[i % 2]:
-        sample = ", ".join(JOBS[kind][label][:6])
-        ss.setdefault(f"job_{kind}_{label}", label in TICKED[kind])
-        if st.checkbox(label, key=f"job_{kind}_{label}", help=sample):
-            chosen.append(label)
+    groups = {label: JOBS[kind][label] for label in ss.get(f"jobs_{kind}", [])}
+    custom = [x.strip() for x in extra.split(",") if x.strip()]
+    if custom:
+        groups["Other"] = custom
+        for x in custom:
+            ROLE_PRIORITY.setdefault(x, 80)
 
-extra = st.text_input("Other job title (type and press Enter; several? use commas)",
-                      key=f"extra_{kind}", placeholder="Example: Sponsorship Manager, Fund Manager")
+    problem = "Type at least one name." if not names else ("Pick at least one job title." if not groups else "")
+    run = st.button("🚀  Build my database", type="primary", disabled=bool(problem), help=problem or None)
 
-# ---------------- Details ----------------
-d1, d2 = st.columns(2)
-want_mobile = d1.checkbox("Include mobile number", value=True)
-all_people = d2.checkbox(f"All people found (no limit per {kind.lower()})", value=False,
-                         key=f"all_people_{kind}")
-per_co = d2.slider(f"Most people per {kind.lower()}", 3, 30, 10 if kind == "VC fund" else 8,
-                   key=f"per_{kind}", disabled=all_people)
-if all_people:
-    per_co = 500
-with st.expander("More options"):
-    use_company_level = st.checkbox("If a person's own email or mobile isn't listed, use the general one "
-                                    "from the website (info@, main number)", value=True)
-    broad = st.checkbox("Search more widely (more people, some less relevant)")
-
-groups = {label: JOBS[kind][label] for label in chosen}
-custom = [x.strip() for x in extra.split(",") if x.strip()]
-if custom:
-    groups["Other"] = custom
-    for x in custom:
-        ROLE_PRIORITY.setdefault(x, 80)
-
-# ---------------- 4. Build ----------------
-st.markdown('<div class="step"><span>4</span> Build</div>', unsafe_allow_html=True)
-problem = "Type at least one name." if not names else ("Pick at least one job title." if not groups else "")
-if problem:
-    st.caption(problem)
-if st.button("🚀  Build my database", type="primary", disabled=bool(problem)):
+# ======================= MIDDLE = PROGRESS + RESULT =======================
+live = st.empty()
+if run:
     todo = [{"company": n["name"], "website": n["url"]} for n in names]
-    results, bar = {}, st.progress(0.0, text="Starting...")
-    workers = 4 if serper else 2
+    results = {}
+    with live.container():
+        bar = st.progress(0.0, text="Starting...")
+        table_ph = st.empty()
+    workers = 4 if CFG.get("serper") else 2
     with ThreadPoolExecutor(workers) as ex:
         futs = {ex.submit(process_company, r, groups, per_co, broad, False, use_company_level): i
                 for i, r in enumerate(todo)}
@@ -934,32 +901,36 @@ if st.button("🚀  Build my database", type="primary", disabled=bool(problem)):
             except Exception:
                 results[i] = []
             bar.progress(n / len(futs), text=f"{n} of {len(todo)} done ({todo[i]['company']})")
-    bar.empty()
+            so_far = [p for j in sorted(results) for p in results[j]]
+            if so_far:
+                with table_ph.container():
+                    show_table(build_dataframe(so_far, ["Mobile"] if want_mobile else []), 420)
+    live.empty()
     ordered = [p for i in sorted(results) for p in results[i]]
     ss.result = build_dataframe(ordered, ["Mobile"] if want_mobile else [])
     ss.empty = [todo[i]["company"] for i in sorted(results) if not results[i]]
-    ss.total, ss.kind_done = len(todo), kind
 
-# ---------------- Result (same page) ----------------
 res = ss.get("result")
-if res is not None:
-    st.markdown("---")
-    if res.empty:
-        st.warning("We couldn't find anyone. Try more job titles, turn on 'Search more widely', "
-                   "or check the spelling of the names.")
-    else:
-        n_email = int((res[[c for c in res.columns if c.startswith("Email")]] != "").any(axis=1).sum())
-        n_li = int((res["LinkedIn"] != "").sum())
-        s1, s2, s3 = st.columns(3)
-        s1.markdown(f'<div class="stat"><b>{len(res)}</b><small>people</small></div>', unsafe_allow_html=True)
-        s2.markdown(f'<div class="stat"><b>{n_li}</b><small>with LinkedIn</small></div>',
-                    unsafe_allow_html=True)
-        s3.markdown(f'<div class="stat"><b>{n_email}</b><small>with email</small></div>',
-                    unsafe_allow_html=True)
-        st.write("")
+if res is None:
+    st.markdown('<div class="empty"><h3>Your database will show here</h3>'
+                "Fill the panel on the left, then press <b>Build my database</b>.</div>",
+                unsafe_allow_html=True)
+elif res.empty:
+    st.warning("We couldn't find anyone. Try more job titles, turn on 'Search more widely', "
+               "or check the spelling of the names.")
+else:
+    email_cols = [c for c in res.columns if c.startswith("Email")]
+    n_email = int((res[email_cols] != "").any(axis=1).sum())
+    n_li = int((res["LinkedIn"] != "").sum())
+    s1, s2, s3, s4 = st.columns([1, 1, 1, 2])
+    s1.markdown(f'<div class="stat"><b>{len(res)}</b><small>people</small></div>', unsafe_allow_html=True)
+    s2.markdown(f'<div class="stat"><b>{n_li}</b><small>with LinkedIn</small></div>', unsafe_allow_html=True)
+    s3.markdown(f'<div class="stat"><b>{n_email}</b><small>with email</small></div>', unsafe_allow_html=True)
+    with s4:
         st.download_button("⬇️  Download CSV (opens in Excel)", res.to_csv(index=False).encode("utf-8-sig"),
                            "database.csv", "text/csv", type="primary")
-        show_table(res)
-        st.caption("Empty cells mean the detail isn't publicly listed. Double-check important contacts.")
+    show_table(res, 430)
+    note = "Empty cells mean the detail isn't publicly listed."
     if ss.get("empty"):
-        st.info("No people found for: " + ", ".join(ss.empty))
+        note += " No people found for: " + ", ".join(ss.empty) + "."
+    st.caption(note)
