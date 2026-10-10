@@ -1,8 +1,9 @@
 import json
 import re
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import pandas as pd
 import requests
@@ -107,6 +108,7 @@ CFG = {}
 UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36"}
 EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
 PHONE_RE = re.compile(r"\+\d[\d\s().-]{8,16}\d")
+IN_MOBILE_RE = re.compile(r"(?<![\d])(?:\+?91[\s-]?|0)?[6-9]\d{4}[\s-]?\d{5}(?![\d])")
 SKIP_HOSTS = ("linkedin", "facebook", "instagram", "twitter", "x.com", "wikipedia", "youtube",
               "crunchbase", "glassdoor", "naukri", "indeed", "bloomberg", "zaubacorp",
               "tracxn", "ambitionbox", "yourstory", "economictimes")
@@ -202,15 +204,16 @@ def _web_search(query, n=10):
 def search_company(company, groups, broad):
     """A few combined LinkedIn searches (instead of one per job type)."""
     candidates = {}
-    items = []
+    # one search per job group (like the original company_people_finder), best roles first
+    queries = []
     for roles in groups.values():
-        items += sorted(roles, key=lambda r: -ROLE_PRIORITY.get(r, 50))[:6]
-    items = list(dict.fromkeys(items))
-    chunks = [items[i:i + 6] for i in range(0, len(items), 6)][:4]
-    queries = [f'site:linkedin.com/in/ "{company}" (' + " OR ".join(f'"{r}"' for r in c) + ")"
-               for c in chunks]
+        top = sorted(roles, key=lambda r: -ROLE_PRIORITY.get(r, 50))[:5]
+        queries.append(f'site:linkedin.com/in/ "{company}" (' + " OR ".join(f'"{r}"' for r in top) + ")")
+    queries = queries[:12]
     if broad:
-        queries.append(f'site:linkedin.com/in/ "{company}" leadership')
+        queries += [f'site:linkedin.com/in/ "{company}"',
+                    f'site:linkedin.com/in/ "{company}" employee',
+                    f'site:linkedin.com/in/ "{company}" leadership']
 
     for query in queries:
         for res in web_search(query, 10):
@@ -321,13 +324,14 @@ def name_key(n):
     return re.sub(r"[^a-z ]", "", (n or "").lower()).strip()
 
 
-def add_person(found, company, name, title="", linkedin="", email="", phone=""):
+def add_person(found, company, name, title="", linkedin="", email="", phone="", profile=""):
     name = normalize_text(name)
     if not NAME_RE.match(name) or any(w.lower() in NOT_NAMES for w in name.split()):
         return
     p = found.setdefault(name_key(name), {
         "company": company, "name": name, "linkedin": "", "title": "", "category": "", "role": "",
-        "score": 0, "instagram": "", "emails": [], "phones": []})
+        "score": 0, "instagram": "", "emails": [], "phones": [], "profile": ""})
+    p["profile"] = p["profile"] or profile
     p["title"] = p["title"] or normalize_text(title)
     p["linkedin"] = p["linkedin"] or clean_url(linkedin)
     if email and email.lower() not in p["emails"]:
@@ -358,39 +362,134 @@ def cards_from_soup(soup, company, found):
                 break
 
 
+KEY_PATH = re.compile(r"team|people|partner|leadership|about|contact|founder|investment|professional|"
+                      r"management|member|who-we|our-|principal|associate|advisor|reach", re.I)
+SKIP_EXT = re.compile(r"\.(pdf|jpe?g|png|svg|gif|webp|zip|mp4|docx?|xlsx?)$", re.I)
+PROFILE_PATH = re.compile(r"/(team|people|partners?|our-team|leadership|members?|professionals|"
+                          r"investment-team|founders?|principals?|about/[a-z-]+)/[^/]+$", re.I)
+MAX_PAGES = 30
+
+
+def fetch_page(url):
+    try:
+        r = requests.get(url, headers=UA, timeout=8)
+        if r.status_code != 200 or "text/html" not in r.headers.get("content-type", ""):
+            return None
+        return r.url, r.text
+    except Exception:
+        return None
+
+
+def sitemap_pages(site):
+    out = []
+    for sm in ("/sitemap.xml", "/sitemap_index.xml", "/wp-sitemap.xml"):
+        try:
+            r = requests.get(site + sm, headers=UA, timeout=8)
+            if r.status_code == 200:
+                out += [u for u in re.findall(r"<loc>\s*([^<\s]+)\s*</loc>", r.text)
+                        if KEY_PATH.search(urlparse(u).path) and not u.endswith(".xml")]
+        except Exception:
+            continue
+    return out[:20]
+
+
+def deobfuscate(text):
+    text = re.sub(r"\s*[\[(]\s*at\s*[\])]\s*", "@", text, flags=re.I)
+    return re.sub(r"\s*[\[(]\s*dot\s*[\])]\s*", ".", text, flags=re.I)
+
+
+def digits10(p):
+    return re.sub(r"\D", "", p)[-10:]
+
+
+def find_phones(text):
+    return PHONE_RE.findall(text) + IN_MOBILE_RE.findall(text)
+
+
 def scrape_team(site, company, groups, broad):
-    """Read a firm's own website: team pages -> people, emails, phones."""
+    """Read a firm's own website: team pages + every person's profile page -> people, emails, phones."""
     if not site.startswith("http"):
         site = "https://" + site
     site = site.rstrip("/")
-    found, emails, phones, texts, links, seen = {}, [], [], [], [], set()
-    for path in TEAM_PATHS:
-        try:
-            r = requests.get(site + path, headers=UA, timeout=8)
-            if r.status_code != 200 or "text/html" not in r.headers.get("content-type", "") \
-                    or r.url in seen:
+    host = urlparse(site).netloc.lower().replace("www.", "")
+    found, texts, links, pages = {}, [], [], {}
+
+    # ---- 1. crawl: standard team/contact pages, then the team-looking links found on them ----
+    queue = [site + p for p in TEAM_PATHS] + sitemap_pages(site)
+    seen = set()
+    for _ in range(3):
+        batch = [u for u in dict.fromkeys(queue) if u not in seen][:max(0, MAX_PAGES - len(seen))]
+        if not batch:
+            break
+        seen.update(batch)
+        with ThreadPoolExecutor(6) as ex:
+            results = list(ex.map(fetch_page, batch))
+        queue = []
+        for res in results:
+            if not res or res[0] in pages:
                 continue
-            seen.add(r.url)
-            soup = BeautifulSoup(r.text, "html.parser")
-        except Exception:
-            continue
-        for t in soup(["script", "style", "noscript"]):
-            t.decompose()
-        for a in soup.select('a[href^="mailto:"]'):
-            emails.append(a["href"][7:].split("?")[0].strip())
-        for a in soup.select('a[href^="tel:"]'):
-            phones.append(a["href"][4:].strip())
+            url, html = res
+            soup = BeautifulSoup(html, "html.parser")
+            pages[url] = soup
+            for a in soup.select("a[href]"):
+                h = urljoin(url, a["href"]).split("#")[0].split("?")[0].rstrip("/")
+                p = urlparse(h)
+                if p.scheme in ("http", "https") and p.netloc.lower().replace("www.", "") == host \
+                        and not SKIP_EXT.search(p.path) and KEY_PATH.search(p.path):
+                    queue.append(h)
+
+    # ---- 2. read every page ----
+    page_data = []   # (url, soup, emails, phones)
+    for url, soup in pages.items():
+        pe = [a["href"][7:].split("?")[0].strip() for a in soup.select('a[href^="mailto:"]')]
+        pp = [a["href"][4:].strip() for a in soup.select('a[href^="tel:"]')]
         for a in soup.select('a[href*="linkedin.com/in/"], a[href^="mailto:"], a[href^="tel:"]'):
             links.append(f"{normalize_text(a.get_text())[:40]} -> {a['href'].split('?')[0]}")
         cards_from_soup(soup, company, found)
-        text = " ".join(soup.get_text(" ").split())
+        for t in soup(["script", "style", "noscript"]):
+            t.decompose()
+        text = deobfuscate(" ".join(soup.get_text(" ").split()))
         texts.append(text[:3000])
-        emails += EMAIL_RE.findall(text)
-        phones += PHONE_RE.findall(text)
+        pe += EMAIL_RE.findall(text)
+        pp += find_phones(text)
+        page_data.append((url, soup, pe, pp))
 
-    # AI reads the page text too (optional; if the AI fails we still keep what we found above)
+    bad = (".png", ".jpg", ".jpeg", ".svg", ".gif", ".webp", "sentry", "wixpress", "example.")
+    email_pages, phone_pages = Counter(), Counter()
+    for _, _, pe, pp in page_data:
+        for e in {x.lower() for x in pe if not any(b in x.lower() for b in bad)}:
+            email_pages[e] += 1
+        for d in {digits10(x) for x in pp}:
+            phone_pages[d] += 1
+
+    # ---- 3. person profile pages: heading = name; their own email / phone / LinkedIn ----
+    for url, soup, pe, pp in page_data:
+        if not PROFILE_PATH.search(urlparse(url).path):
+            continue
+        h = soup.find("h1") or soup.find("h2")
+        name = normalize_text(h.get_text()) if h else ""
+        if not NAME_RE.match(name) or any(w.lower() in NOT_NAMES for w in name.split()):
+            continue
+        lines = [x for x in (normalize_text(t) for t in soup.get_text("\n").split("\n")) if x]
+        seg = lines[lines.index(name) + 1: lines.index(name) + 8] if name in lines else []
+        role = next((x for x in seg if len(x) < 80 and ROLE_WORDS.search(x)), "")
+        li = next((a["href"] for a in soup.select('a[href*="linkedin.com/in/"]')), "")
+        toks = re.findall(r"[a-z]{3,}", name.lower())
+        add_person(found, company, name, role, li, profile=url)
+        for e in dict.fromkeys(x.lower() for x in pe):
+            local = e.split("@")[0]
+            generic_local = re.split(r"[^a-z]", local)[0] in GENERIC_LOCALS
+            if any(b in e for b in bad):
+                continue
+            if any(t in local for t in toks) or (not generic_local and email_pages[e] <= 2):
+                add_person(found, company, name, email=e)
+        for ph in dict.fromkeys(re.sub(r"\s+", " ", x).strip() for x in pp):
+            if phone_pages[digits10(ph)] == 1:
+                add_person(found, company, name, phone=ph)
+
+    # ---- 4. AI reads the page text too (optional) ----
     if CFG.get("api_key") and texts:
-        blob = "\n".join(texts)[:6500] + "\nLINKS:\n" + "\n".join(dict.fromkeys(links))[:2500]
+        blob = "\n".join(texts[:6])[:6500] + "\nLINKS:\n" + "\n".join(dict.fromkeys(links))[:2500]
         prompt = f"""Below is text and links from the website of "{company}". List the team members
 (partners, principals, associates, analysts, founders, staff). Return ONLY a JSON array of objects with keys
 "name", "designation", "email", "phone", "linkedin". Use ONLY what is explicitly present in the text or links.
@@ -408,9 +507,14 @@ Use "" if unknown. Never guess emails or phone numbers.
         except Exception:
             pass
 
-    bad = (".png", ".jpg", ".jpeg", ".svg", ".gif", ".webp", "sentry", "wixpress", "example.")
-    emails = [e for e in dict.fromkeys(x.lower() for x in emails) if not any(b in e for b in bad)]
-    phones = list(dict.fromkeys(re.sub(r"\s+", " ", p).strip() for p in phones))
+    emails = list(email_pages)
+    phones = []
+    for d, _ in phone_pages.most_common():       # company-wide numbers (on many pages) first
+        for _, _, _, pp in page_data:
+            hit = next((re.sub(r"\s+", " ", x).strip() for x in pp if digits10(x) == d), "")
+            if hit:
+                phones.append(hit)
+                break
 
     people = []
     for p in found.values():
@@ -446,6 +550,9 @@ def process_company(row, groups, per_co, broad, want_ig, use_company_level):
     site = row.get("website")
     if not isinstance(site, str) or not site.strip():
         site = guess_website(company)
+    if site:
+        u = urlparse(site.strip() if site.strip().startswith("http") else "https://" + site.strip())
+        site = f"{u.scheme}://{u.netloc}"
     web_people, emails, phones = [], [], []
     if site:
         try:
@@ -453,7 +560,7 @@ def process_company(row, groups, per_co, broad, want_ig, use_company_level):
         except Exception:
             pass
     searched = []
-    if broad or len(web_people) < per_co:  # website already gave enough? skip the slower search
+    if broad or len(web_people) < per_co or any(not p["linkedin"] for p in web_people):
         searched = rank_people(search_company(company, groups, broad), per_co)
     people = merge_people(web_people, searched)
     people.sort(key=lambda p: p["score"], reverse=True)
@@ -465,7 +572,7 @@ def process_company(row, groups, per_co, broad, want_ig, use_company_level):
         if not p["emails"]:
             mine = re.findall(r"[a-z]{3,}", p["name"].lower())
             personal = [e for e in emails if any(t in e.split("@")[0] for t in mine)]
-            p["emails"] = (personal + (generic if use_company_level else []))[:4]
+            p["emails"] = (personal + (generic if use_company_level else []))[:5]
         if not p["phones"] and use_company_level:
             p["phones"] = phones[:1]
         if want_ig:
@@ -563,12 +670,15 @@ def build_dataframe(people, cols):
     out = []
     for i, p in enumerate(people, 1):
         d = {"Sr No": i, "Name": p["name"], "Designation": p["title"],
-             "Company": p["company"], "Website": p.get("website", ""), "LinkedIn": p["linkedin"]}
+             "Company": p["company"], "Website": p.get("website", ""),
+             "Profile Page": p.get("profile", ""), "LinkedIn": p["linkedin"]}
         if "Instagram" in cols:
             d["Instagram"] = p["instagram"]
-        for k in range(4):
+        for k in range(5):
             d[f"Email {k + 1}"] = p["emails"][k] if k < len(p["emails"]) else ""
-        d["Mobile"] = p["phones"][0] if p["phones"] else ""
+        if "Mobile" in cols:
+            for k in range(3):
+                d["Mobile" if k == 0 else f"Mobile {k + 1}"] = p["phones"][k] if k < len(p["phones"]) else ""
         out.append(d)
     return pd.DataFrame(out)
 
@@ -581,51 +691,119 @@ def get_secret(name):
 
 
 # ============================================================
-# UI  (one simple page)
+# UI  (everything on ONE page)
 # ============================================================
+ROLE_GROUPS.update({
+    "Sponsorship / Brand Partnerships": [
+        "Sponsorship", "Sponsorships", "Brand Partnerships", "Brand Alliances",
+        "Sponsorship Manager", "Brand Collaboration", "Influencer Marketing"],
+    "Brand / Creative / Content": [
+        "Brand Manager", "Brand Head", "Head of Brand", "Creative Director", "Content Marketing",
+        "Content Head", "Social Media", "Digital Marketing", "Head of Content"],
+    "Sales / Revenue": [
+        "Sales", "Head of Sales", "Sales Head", "VP Sales", "Chief Revenue Officer", "CRO",
+        "Key Account Manager", "Account Manager"],
+    "Finance / CFO": [
+        "CFO", "Chief Financial Officer", "Finance Head", "Head of Finance", "Finance Controller"],
+    "Operations / COO": [
+        "COO", "Chief Operating Officer", "Operations Head", "Head of Operations",
+        "Operations Manager"],
+    "Technology / CTO": [
+        "CTO", "Chief Technology Officer", "Head of Engineering", "VP Engineering"],
+    "CSR / Sustainability": [
+        "CSR", "Corporate Social Responsibility", "Sustainability", "ESG", "Social Impact"],
+})
+ROLE_PRIORITY.update({
+    "Sponsorship": 70, "Sponsorships": 70, "Sponsorship Manager": 72, "Brand Partnerships": 78,
+    "Brand Alliances": 72, "Brand Collaboration": 68, "Influencer Marketing": 62,
+    "Brand Manager": 70, "Brand Head": 82, "Head of Brand": 82, "Creative Director": 72,
+    "Content Marketing": 62, "Content Head": 72, "Head of Content": 72, "Social Media": 55,
+    "Digital Marketing": 66,
+    "Sales": 55, "Head of Sales": 78, "Sales Head": 78, "VP Sales": 78,
+    "Chief Revenue Officer": 85, "CRO": 82, "Key Account Manager": 55, "Account Manager": 50,
+    "CFO": 85, "Chief Financial Officer": 85, "Finance Head": 75, "Head of Finance": 75,
+    "Finance Controller": 65,
+    "COO": 85, "Chief Operating Officer": 85, "Operations Head": 75, "Head of Operations": 75,
+    "Operations Manager": 60,
+    "CTO": 85, "Chief Technology Officer": 85, "Head of Engineering": 75, "VP Engineering": 75,
+    "CSR": 65, "Corporate Social Responsibility": 68, "Sustainability": 60, "ESG": 60,
+    "Social Impact": 58,
+})
+
+JOBS = {
+    "Company": {
+        "Corporate Communications": ROLE_GROUPS["Corporate Communications"],
+        "PR / Media": ROLE_GROUPS["PR / Media"],
+        "Marketing": ROLE_GROUPS["Marketing"],
+        "Founder's / CEO Office": ROLE_GROUPS["Founder's / CEO Office"],
+        "Partnerships / Business Dev": ROLE_GROUPS["Partnerships / Business Development"],
+        "Events / Community": ROLE_GROUPS["Events / Community"],
+        "Corporate Affairs": ROLE_GROUPS["Corporate Affairs"],
+        "Investor / Corporate Relations": ROLE_GROUPS["Investor / Corporate Relations"],
+        "Leadership (Founder, CEO, MD)": ROLE_GROUPS["Leadership"],
+        "Sponsorship / Brand Partnerships": ROLE_GROUPS["Sponsorship / Brand Partnerships"],
+        "Brand / Creative / Content": ROLE_GROUPS["Brand / Creative / Content"],
+        "Sales / Revenue": ROLE_GROUPS["Sales / Revenue"],
+        "Product": ROLE_GROUPS["Product"],
+        "HR / Campus Hiring": ROLE_GROUPS["HR / Campus Hiring"],
+        "CSR / Sustainability": ROLE_GROUPS["CSR / Sustainability"],
+        "Finance / CFO": ROLE_GROUPS["Finance / CFO"],
+        "Operations / COO": ROLE_GROUPS["Operations / COO"],
+        "Technology / CTO": ROLE_GROUPS["Technology / CTO"],
+    },
+    "VC fund": {
+        "Partner": ["Managing Partner", "General Partner", "Venture Partner", "Partner"],
+        "Principal": ["Principal"],
+        "Senior Associate": ["Senior Associate"],
+        "Associate": ["Associate"],
+    },
+}
+TICKED = {
+    "Company": ["Corporate Communications", "PR / Media", "Marketing", "Founder's / CEO Office",
+                "Partnerships / Business Dev", "Events / Community", "Corporate Affairs",
+                "Investor / Corporate Relations", "Leadership (Founder, CEO, MD)",
+                "Sponsorship / Brand Partnerships"],
+    "VC fund": ["Partner", "Principal", "Senior Associate", "Associate"],
+}
+
 st.markdown("""
 <style>
-#MainMenu, footer {visibility: hidden;}
-.block-container {max-width: 760px; padding-top: 2rem;}
+#MainMenu, footer, header[data-testid="stHeader"] {visibility: hidden; height: 0;}
+.block-container {max-width: 820px; padding-top: 1.2rem; padding-bottom: 4rem;}
+div[data-testid="InputInstructions"] {display: none;}
+.hero {background: linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%); color: #fff;
+       padding: 1.4rem 1.6rem; border-radius: 18px; margin-bottom: 1.2rem;}
+.hero h1 {margin: 0; font-size: 1.7rem; color: #fff; padding: 0;}
+.hero p {margin: .3rem 0 0; opacity: .9; font-size: .98rem;}
+.step {display: flex; align-items: center; gap: .6rem; margin: 1.4rem 0 .5rem;
+       font-weight: 700; font-size: 1.12rem;}
+.step span {background: #4f46e5; color: #fff; width: 1.7rem; height: 1.7rem; border-radius: 50%;
+            display: inline-flex; align-items: center; justify-content: center; font-size: .9rem;}
+.hint {color: #6b7280; font-size: .9rem; margin: -.2rem 0 .5rem;}
 div.stButton > button, div.stDownloadButton > button {
-    width: 100%; padding: 0.85rem 1rem; font-size: 1.1rem; border-radius: 12px;
-}
-.hint {color: #6b7280; font-size: 0.95rem; margin-bottom: 0.8rem;}
+    width: 100%; padding: .8rem 1rem; font-size: 1.08rem; border-radius: 12px; font-weight: 600;}
+div[role="radiogroup"] {gap: .6rem;}
+div[role="radiogroup"] label {border: 1.5px solid #d1d5db; border-radius: 12px; padding: .5rem 1.1rem;
+                              background: rgba(127,127,127,.06);}
+div[role="radiogroup"] label:has(input:checked) {border-color: #4f46e5; background: rgba(79,70,229,.14);}
+.stat {border: 1px solid rgba(127,127,127,.3); border-radius: 14px; padding: .8rem 1rem; text-align: center;}
+.stat b {display: block; font-size: 1.6rem; color: #4f46e5;}
+.stat small {color: #6b7280;}
 </style>
 """, unsafe_allow_html=True)
 
-FRIENDLY = {
-    "Corporate Communications": "Corporate communications",
-    "PR / Media": "PR and media",
-    "Marketing": "Marketing and brand",
-    "Founder's / CEO Office": "Founder's office / CEO office",
-    "Partnerships / Business Development": "Partnerships and business development",
-    "Corporate Affairs": "Corporate affairs",
-    "Leadership": "Founders and leadership (CEO, MD)",
-    "Investor / Corporate Relations": "Investor and corporate relations",
-    "Events / Community": "Events and community",
-    "Product": "Product managers",
-    "HR / Campus Hiring": "HR and campus hiring",
-    "VC / Investment Team": "VC investors (Partner, Principal, Senior Associate, Associate)",
-    "VC Analysts & Platform": "VC analysts and platform team",
-}
-LABEL_TO_GROUP = {v: k for k, v in FRIENDLY.items()}
-COMPANY_DEFAULT = ["Corporate Communications", "PR / Media", "Marketing", "Founder's / CEO Office",
-                   "Partnerships / Business Development", "Events / Community"]
-VC_DEFAULT = ["VC / Investment Team"]
-
-# Keys live in Streamlit "Secrets", so friends never see or need them.
 api_key = get_secret("LLM_API_KEY") or get_secret("GROQ_API_KEY")
 serper = get_secret("SERPER_API_KEY")
 base_url = get_secret("LLM_BASE_URL") or "https://api.groq.com/openai/v1"
 model = get_secret("LLM_MODEL") or "llama-3.3-70b-versatile"
 
 with st.sidebar:
-    with st.expander("Admin setup (only for the app owner)"):
-        api_key = st.text_input("Groq API key (free, from console.groq.com)", type="password", value=api_key)
-        serper = st.text_input("Serper API key (optional)", type="password", value=serper)
+    with st.expander("Admin setup (only for the app owner, all optional)"):
+        api_key = st.text_input("Groq API key (optional, helps read tricky websites)", type="password",
+                                value=api_key)
+        serper = st.text_input("Serper API key (optional, better search)", type="password", value=serper)
         model = st.text_input("Model", value=model)
-        base_url = st.text_input("API base URL (change only to use another provider)", value=base_url)
+        base_url = st.text_input("API base URL", value=base_url)
         if st.button("Test AI connection"):
             CFG.update(api_key=api_key, serper=serper, model=model, base_url=base_url)
             try:
@@ -633,8 +811,6 @@ with st.sidebar:
                                  headers={"Authorization": f"Bearer {api_key.strip()}"}, timeout=20)
                 st.write(f"Key check: HTTP {r.status_code}")
                 if r.ok:
-                    ids = [m.get("id", "") for m in r.json().get("data", [])]
-                    st.write("Model found: " + ("yes" if model in ids else "NO. Try one of: " + ", ".join(ids[:12])))
                     st.success("AI replied: " + llm("Reply with the single word OK", 5))
                 else:
                     st.code(r.text[:400])
@@ -644,88 +820,112 @@ with st.sidebar:
 CFG.update(api_key=api_key, serper=serper, model=model, base_url=base_url)
 ss = st.session_state
 
-st.title("📇 DB Builder")
-st.markdown('<div class="hint">Type an area or some names. We visit each website and build your '
-            "contact list: name, job title, LinkedIn, email and mobile.</div>", unsafe_allow_html=True)
 
-kind = st.radio("What are you looking for?", ["🏢 Companies", "💰 VC funds"], horizontal=True)
-is_vc = "VC" in kind
-entity = "VC firms" if is_vc else "companies"
+URL_END = re.compile(r"[\s|]+((?:https?://)?(?:www\.)?[\w-]+(?:\.[\w-]+)*\.[a-z]{2,}(?:/\S*)?)\s*$", re.I)
 
-how = st.radio("How do you want to start?",
-               ["🔍 Find them for me (type an area)", "📝 I have the names"], horizontal=True)
-find_mode = how.startswith("🔍")
 
-area, names, count = "", "", 20
-if find_mode:
-    area = st.text_input(f"Which area?", placeholder="Example: fintech, EV startups, clothing brands, early-stage")
-    count = st.select_slider(f"How many {entity}?", options=[10, 20, 30, 40, 50], value=20)
-    if not api_key:
-        st.warning("Searching by area needs the app owner to finish setup (small arrow at the top-left, "
-                   "'Admin setup'). Meanwhile choose 'I have the names'.")
-else:
-    names = st.text_area(f"Type one {'VC fund' if is_vc else 'company'} per line", height=150,
-                         placeholder="Zerodha\nRazorpay\nSequoia Capital India" if not is_vc
-                         else "Blume Ventures\nAccel India\nPeak XV Partners")
+def parse_names(text):
+    """One per line or comma separated. Optional website after the name: 'Blume Ventures | blume.vc'."""
+    out, seen = [], set()
+    for part in re.split(r"[\n,;]+", text or ""):
+        part = re.sub(r"^\s*(\d+[.)]|[-•*])\s*", "", part).strip()
+        url, name = "", part
+        m = URL_END.search(part)
+        if m:
+            url, name = m.group(1), part[:m.start()].strip(" |-")
+        elif re.fullmatch(r"(?:https?://)?(?:www\.)?[\w-]+(?:\.[\w-]+)*\.[a-z]{2,}(?:/\S*)?", part, re.I):
+            url, name = part, ""
+        if url and not name:
+            name = urlparse(url if url.startswith("http") else "https://" + url).netloc.replace("www.", "").split(".")[0].title()
+        if name and name.lower() not in seen:
+            seen.add(name.lower())
+            out.append({"name": name, "url": url})
+    return out
 
-with st.expander("More options (optional)"):
-    default_groups = VC_DEFAULT if is_vc else COMPANY_DEFAULT
-    picked = st.multiselect("Which job types do you want?", list(LABEL_TO_GROUP),
-                            default=[FRIENDLY[g] for g in default_groups], key=f"jobs_{is_vc}")
-    extra = st.text_input("Another job title? (separate with commas)",
-                          placeholder="Example: Sponsorship Manager, Fund Manager")
-    per_co = st.slider("Most people to keep per company", 3, 20, 10 if is_vc else 5, key=f"per_{is_vc}")
-    region = st.text_input("Country or city", value="India")
-    want_ig = st.checkbox("Also find Instagram IDs (slower)")
-    use_company_level = st.checkbox("If a person's own email or mobile isn't listed, use the company's "
-                                    "general one (like info@ or the main number)", value=True)
+
+def set_all(kind, value):
+    for label in JOBS[kind]:
+        ss[f"job_{kind}_{label}"] = value
+
+
+def show_table(df):
+    try:
+        st.dataframe(df, hide_index=True, width="stretch")
+    except TypeError:
+        st.dataframe(df, hide_index=True, use_container_width=True)
+
+
+st.markdown('<div class="hero"><h1>📇 DB Builder</h1>'
+            "<p>Give names. Pick job titles. Get a ready CSV with LinkedIn, email and phone.</p></div>",
+            unsafe_allow_html=True)
+
+# ---------------- 1. Company or VC ----------------
+st.markdown('<div class="step"><span>1</span> What do you want to find?</div>', unsafe_allow_html=True)
+choice = st.radio("Type", ["🏢 Company", "💰 VC fund"], horizontal=True, label_visibility="collapsed")
+kind = "Company" if "Company" in choice else "VC fund"
+
+# ---------------- 2. Names ----------------
+st.markdown(f'<div class="step"><span>2</span> Which {kind}s?</div>', unsafe_allow_html=True)
+st.markdown('<div class="hint">One per line, or separated by commas. Max 60. Know the website? Add it '
+            'after the name, like <b>Blume Ventures | blume.vc</b>. Otherwise it is found automatically.</div>',
+            unsafe_allow_html=True)
+txt = st.text_area("Names", height=150, key=f"names_{kind}", label_visibility="collapsed",
+                   placeholder="Blume Ventures\nAccel India\nPeak XV Partners" if kind == "VC fund"
+                   else "Zerodha\nRazorpay\nSwiggy")
+names = parse_names(txt)[:60]
+if names:
+    st.caption(f"{len(names)} {kind}(s) ready")
+
+# ---------------- 3. Job titles ----------------
+st.markdown('<div class="step"><span>3</span> Which job titles?</div>', unsafe_allow_html=True)
+b1, b2, _ = st.columns([1, 1, 3])
+b1.button("Select all", key=f"all_{kind}", on_click=set_all, args=(kind, True))
+b2.button("Clear", key=f"none_{kind}", on_click=set_all, args=(kind, False))
+
+chosen = []
+cols = st.columns(2)
+for i, label in enumerate(JOBS[kind]):
+    with cols[i % 2]:
+        sample = ", ".join(JOBS[kind][label][:6])
+        ss.setdefault(f"job_{kind}_{label}", label in TICKED[kind])
+        if st.checkbox(label, key=f"job_{kind}_{label}", help=sample):
+            chosen.append(label)
+
+extra = st.text_input("Other job title (type and press Enter; several? use commas)",
+                      key=f"extra_{kind}", placeholder="Example: Sponsorship Manager, Fund Manager")
+
+# ---------------- Details ----------------
+d1, d2 = st.columns(2)
+want_mobile = d1.checkbox("Include mobile number", value=True)
+all_people = d2.checkbox(f"All people found (no limit per {kind.lower()})", value=False,
+                         key=f"all_people_{kind}")
+per_co = d2.slider(f"Most people per {kind.lower()}", 3, 30, 10 if kind == "VC fund" else 8,
+                   key=f"per_{kind}", disabled=all_people)
+if all_people:
+    per_co = 500
+with st.expander("More options"):
+    use_company_level = st.checkbox("If a person's own email or mobile isn't listed, use the general one "
+                                    "from the website (info@, main number)", value=True)
     broad = st.checkbox("Search more widely (more people, some less relevant)")
 
-groups = {LABEL_TO_GROUP[p]: ROLE_GROUPS[LABEL_TO_GROUP[p]] for p in picked}
+groups = {label: JOBS[kind][label] for label in chosen}
 custom = [x.strip() for x in extra.split(",") if x.strip()]
 if custom:
-    groups["Custom"] = custom
+    groups["Other"] = custom
     for x in custom:
         ROLE_PRIORITY.setdefault(x, 80)
 
-ready = bool(groups) and ((find_mode and area.strip() and api_key) or (not find_mode and names.strip()))
-go_clicked = st.button("🚀  Build my database", type="primary", disabled=not ready)
-
-if go_clicked:
-    bar = st.progress(0.0, text="Starting...")
-    rows = []
-    if find_mode:
-        bar.progress(0.03, text=f"Finding {entity} in '{area.strip()}'...")
-        try:
-            for c in find_companies(area.strip(), count, entity, region):
-                if isinstance(c, dict) and c.get("company"):
-                    rows.append({"company": c["company"], "website": c.get("website", "") or ""})
-        except Exception as e:
-            bar.empty()
-            st.error(explain_ai_error(e))
-            st.stop()
-    else:
-        for line in names.splitlines():
-            if line.strip():
-                parts = [x.strip() for x in line.split(",")]
-                rows.append({"company": parts[0], "website": parts[1] if len(parts) > 1 else ""})
-    # remove duplicates, keep order
-    seen, todo = set(), []
-    for r in rows:
-        k = r["company"].lower()
-        if k not in seen:
-            seen.add(k)
-            todo.append(r)
-    todo = todo[:60]
-
-    if not todo:
-        bar.empty()
-        st.error("We couldn't find any. Try a simpler area (like 'fintech') or type the names yourself.")
-        st.stop()
-
-    results, workers = {}, (4 if serper else 2)
+# ---------------- 4. Build ----------------
+st.markdown('<div class="step"><span>4</span> Build</div>', unsafe_allow_html=True)
+problem = "Type at least one name." if not names else ("Pick at least one job title." if not groups else "")
+if problem:
+    st.caption(problem)
+if st.button("🚀  Build my database", type="primary", disabled=bool(problem)):
+    todo = [{"company": n["name"], "website": n["url"]} for n in names]
+    results, bar = {}, st.progress(0.0, text="Starting...")
+    workers = 4 if serper else 2
     with ThreadPoolExecutor(workers) as ex:
-        futs = {ex.submit(process_company, r, groups, per_co, broad, want_ig, use_company_level): i
+        futs = {ex.submit(process_company, r, groups, per_co, broad, False, use_company_level): i
                 for i, r in enumerate(todo)}
         for n, f in enumerate(as_completed(futs), 1):
             i = futs[f]
@@ -733,30 +933,33 @@ if go_clicked:
                 results[i] = f.result()
             except Exception:
                 results[i] = []
-            bar.progress(n / len(futs), text=f"Reading websites: {n} of {len(todo)} done ({todo[i]['company']})")
+            bar.progress(n / len(futs), text=f"{n} of {len(todo)} done ({todo[i]['company']})")
     bar.empty()
     ordered = [p for i in sorted(results) for p in results[i]]
-    ss.result = build_dataframe(ordered, ["Instagram"] if want_ig else [])
+    ss.result = build_dataframe(ordered, ["Mobile"] if want_mobile else [])
     ss.empty = [todo[i]["company"] for i in sorted(results) if not results[i]]
-    ss.total = len(todo)
+    ss.total, ss.kind_done = len(todo), kind
 
-# ------------------------------------------------------------
-# Results
-# ------------------------------------------------------------
-if "result" in ss:
-    res = ss.result
+# ---------------- Result (same page) ----------------
+res = ss.get("result")
+if res is not None:
     st.markdown("---")
     if res.empty:
-        st.warning("We couldn't find anyone this time. Try 'Search more widely' in More options, "
-                   "pick more job types, or add a Serper key.")
+        st.warning("We couldn't find anyone. Try more job titles, turn on 'Search more widely', "
+                   "or check the spelling of the names.")
     else:
-        st.success(f"Done! Found {len(res)} people from {ss.total - len(ss.empty)} of {ss.total} "
-                   f"{'VC funds' if is_vc else 'companies'}.")
-        st.download_button("⬇️  Download my database (CSV, opens in Excel)",
-                           res.to_csv(index=False).encode("utf-8-sig"), "database.csv", "text/csv",
-                           type="primary")
-        st.dataframe(res, use_container_width=True, hide_index=True)
-        st.caption("Empty cells mean that detail isn't publicly listed. Please double-check important "
-                   "contacts before reaching out.")
+        n_email = int((res[[c for c in res.columns if c.startswith("Email")]] != "").any(axis=1).sum())
+        n_li = int((res["LinkedIn"] != "").sum())
+        s1, s2, s3 = st.columns(3)
+        s1.markdown(f'<div class="stat"><b>{len(res)}</b><small>people</small></div>', unsafe_allow_html=True)
+        s2.markdown(f'<div class="stat"><b>{n_li}</b><small>with LinkedIn</small></div>',
+                    unsafe_allow_html=True)
+        s3.markdown(f'<div class="stat"><b>{n_email}</b><small>with email</small></div>',
+                    unsafe_allow_html=True)
+        st.write("")
+        st.download_button("⬇️  Download CSV (opens in Excel)", res.to_csv(index=False).encode("utf-8-sig"),
+                           "database.csv", "text/csv", type="primary")
+        show_table(res)
+        st.caption("Empty cells mean the detail isn't publicly listed. Double-check important contacts.")
     if ss.get("empty"):
-        st.info("No people found for: " + ", ".join(ss.empty[:30]))
+        st.info("No people found for: " + ", ".join(ss.empty))
