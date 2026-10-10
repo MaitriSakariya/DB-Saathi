@@ -10,7 +10,7 @@ import requests
 import streamlit as st
 from bs4 import BeautifulSoup
 
-st.set_page_config(page_title="DB Builder", page_icon="📇", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="DB Builder", page_icon="📇", layout="wide", initial_sidebar_state="collapsed")
 
 # ============================================================
 # ROLE GROUPS  (your original groups + a few new ones)
@@ -775,14 +775,7 @@ st.markdown("""
 header[data-testid="stHeader"] {background: transparent;}
 .block-container {max-width: 100%; padding: 0.8rem 1.6rem 0.5rem;}
 div[data-testid="InputInstructions"] {display: none;}
-@media (min-width: 992px) {
-  [data-testid="stSidebar"] {min-width: 370px !important; max-width: 370px !important;}
-  [data-testid="stSidebarCollapseButton"], [data-testid="stSidebarCollapsedControl"] {display: none !important;}
-}
-[data-testid="stSidebar"] [data-testid="stSidebarHeader"] {display: none;}
-[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] {padding-top: 0.6rem;}
-[data-testid="stSidebar"] [data-testid="stVerticalBlock"] {gap: 0.55rem;}
-[data-testid="stSidebar"] label p {font-size: 0.86rem; font-weight: 600;}
+label p {font-size: 0.86rem; font-weight: 600;}
 .brand {font-size: 1.35rem; font-weight: 800; margin: 0;}
 .hint {color: #6b7280; font-size: .8rem; margin: -.3rem 0 0;}
 div.stButton > button, div.stDownloadButton > button {
@@ -840,8 +833,9 @@ def show_table(df, height):
         st.dataframe(df, hide_index=True, use_container_width=True, height=height)
 
 
-# ======================= SIDE PANEL = ALL INPUTS =======================
-with st.sidebar:
+# ======================= LEFT PANEL = ALL INPUTS =======================
+left, right = st.columns([1, 2.2], gap="large")
+with left, st.container(border=True):
     st.markdown('<p class="brand">📇 DB Builder</p>', unsafe_allow_html=True)
     choice = st.radio("Type", ["🏢 Company", "💰 VC fund"], horizontal=True, label_visibility="collapsed")
     kind = "Company" if "Company" in choice else "VC fund"
@@ -883,54 +877,55 @@ with st.sidebar:
     run = st.button("🚀  Build my database", type="primary", disabled=bool(problem), help=problem or None)
 
 # ======================= MIDDLE = PROGRESS + RESULT =======================
-live = st.empty()
-if run:
-    todo = [{"company": n["name"], "website": n["url"]} for n in names]
-    results = {}
-    with live.container():
-        bar = st.progress(0.0, text="Starting...")
-        table_ph = st.empty()
-    workers = 4 if CFG.get("serper") else 2
-    with ThreadPoolExecutor(workers) as ex:
-        futs = {ex.submit(process_company, r, groups, per_co, broad, False, use_company_level): i
-                for i, r in enumerate(todo)}
-        for n, f in enumerate(as_completed(futs), 1):
-            i = futs[f]
-            try:
-                results[i] = f.result()
-            except Exception:
-                results[i] = []
-            bar.progress(n / len(futs), text=f"{n} of {len(todo)} done ({todo[i]['company']})")
-            so_far = [p for j in sorted(results) for p in results[j]]
-            if so_far:
-                with table_ph.container():
-                    show_table(build_dataframe(so_far, ["Mobile"] if want_mobile else []), 420)
-    live.empty()
-    ordered = [p for i in sorted(results) for p in results[i]]
-    ss.result = build_dataframe(ordered, ["Mobile"] if want_mobile else [])
-    ss.empty = [todo[i]["company"] for i in sorted(results) if not results[i]]
+with right:
+    live = st.empty()
+    if run:
+        todo = [{"company": n["name"], "website": n["url"]} for n in names]
+        results = {}
+        with live.container():
+            bar = st.progress(0.0, text="Starting...")
+            table_ph = st.empty()
+        workers = 4 if CFG.get("serper") else 2
+        with ThreadPoolExecutor(workers) as ex:
+            futs = {ex.submit(process_company, r, groups, per_co, broad, False, use_company_level): i
+                    for i, r in enumerate(todo)}
+            for n, f in enumerate(as_completed(futs), 1):
+                i = futs[f]
+                try:
+                    results[i] = f.result()
+                except Exception:
+                    results[i] = []
+                bar.progress(n / len(futs), text=f"{n} of {len(todo)} done ({todo[i]['company']})")
+                so_far = [p for j in sorted(results) for p in results[j]]
+                if so_far:
+                    with table_ph.container():
+                        show_table(build_dataframe(so_far, ["Mobile"] if want_mobile else []), 420)
+        live.empty()
+        ordered = [p for i in sorted(results) for p in results[i]]
+        ss.result = build_dataframe(ordered, ["Mobile"] if want_mobile else [])
+        ss.empty = [todo[i]["company"] for i in sorted(results) if not results[i]]
 
-res = ss.get("result")
-if res is None:
-    st.markdown('<div class="empty"><h3>Your database will show here</h3>'
-                "Fill the panel on the left, then press <b>Build my database</b>.</div>",
-                unsafe_allow_html=True)
-elif res.empty:
-    st.warning("We couldn't find anyone. Try more job titles, turn on 'Search more widely', "
-               "or check the spelling of the names.")
-else:
-    email_cols = [c for c in res.columns if c.startswith("Email")]
-    n_email = int((res[email_cols] != "").any(axis=1).sum())
-    n_li = int((res["LinkedIn"] != "").sum())
-    s1, s2, s3, s4 = st.columns([1, 1, 1, 2])
-    s1.markdown(f'<div class="stat"><b>{len(res)}</b><small>people</small></div>', unsafe_allow_html=True)
-    s2.markdown(f'<div class="stat"><b>{n_li}</b><small>with LinkedIn</small></div>', unsafe_allow_html=True)
-    s3.markdown(f'<div class="stat"><b>{n_email}</b><small>with email</small></div>', unsafe_allow_html=True)
-    with s4:
-        st.download_button("⬇️  Download CSV (opens in Excel)", res.to_csv(index=False).encode("utf-8-sig"),
-                           "database.csv", "text/csv", type="primary")
-    show_table(res, 430)
-    note = "Empty cells mean the detail isn't publicly listed."
-    if ss.get("empty"):
-        note += " No people found for: " + ", ".join(ss.empty) + "."
-    st.caption(note)
+    res = ss.get("result")
+    if res is None:
+        st.markdown('<div class="empty"><h3>Your database will show here</h3>'
+                    "Fill the panel on the left, then press <b>Build my database</b>.</div>",
+                    unsafe_allow_html=True)
+    elif res.empty:
+        st.warning("We couldn't find anyone. Try more job titles, turn on 'Search more widely', "
+                   "or check the spelling of the names.")
+    else:
+        email_cols = [c for c in res.columns if c.startswith("Email")]
+        n_email = int((res[email_cols] != "").any(axis=1).sum())
+        n_li = int((res["LinkedIn"] != "").sum())
+        s1, s2, s3, s4 = st.columns([1, 1, 1, 2])
+        s1.markdown(f'<div class="stat"><b>{len(res)}</b><small>people</small></div>', unsafe_allow_html=True)
+        s2.markdown(f'<div class="stat"><b>{n_li}</b><small>with LinkedIn</small></div>', unsafe_allow_html=True)
+        s3.markdown(f'<div class="stat"><b>{n_email}</b><small>with email</small></div>', unsafe_allow_html=True)
+        with s4:
+            st.download_button("⬇️  Download CSV (opens in Excel)", res.to_csv(index=False).encode("utf-8-sig"),
+                               "database.csv", "text/csv", type="primary")
+        show_table(res, 430)
+        note = "Empty cells mean the detail isn't publicly listed."
+        if ss.get("empty"):
+            note += " No people found for: " + ", ".join(ss.empty) + "."
+        st.caption(note)
