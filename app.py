@@ -300,17 +300,34 @@ def process_company(row, groups, per_co, broad, want_ig, want_contact, use_compa
 def llm(prompt, max_tokens=3000):
     """Works with any OpenAI-compatible API. Default: Groq (free)."""
     url = CFG["base_url"].rstrip("/") + "/chat/completions"
-    headers = {"Authorization": f"Bearer {CFG['api_key']}", "Content-Type": "application/json"}
-    body = {"model": CFG["model"], "max_tokens": max_tokens, "temperature": 0.1,
-            "messages": [{"role": "user", "content": prompt}]}
-    for attempt in range(4):
-        r = requests.post(url, headers=headers, json=body, timeout=60)
-        if r.status_code == 429:  # free-tier rate limit: wait and retry
-            time.sleep(min(float(r.headers.get("retry-after", 5 * (attempt + 1))), 30))
-            continue
-        r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"] or ""
-    return ""
+    headers = {"Authorization": f"Bearer {CFG['api_key'].strip()}", "Content-Type": "application/json"}
+    models = [CFG["model"]] + [m for m in ("llama-3.1-8b-instant",) if m != CFG["model"]]
+    last = "no response"
+    for model in models:
+        body = {"model": model, "max_tokens": max_tokens, "temperature": 0.1,
+                "messages": [{"role": "user", "content": prompt}]}
+        r = None
+        for attempt in range(4):
+            r = requests.post(url, headers=headers, json=body, timeout=60)
+            if r.status_code != 429:
+                break
+            time.sleep(min(float(r.headers.get("retry-after", 5 * (attempt + 1))), 30))  # free-tier limit
+        if r.ok:
+            return r.json()["choices"][0]["message"]["content"] or ""
+        last = f"{r.status_code} - {r.text[:300]}"
+        if r.status_code in (401, 403):  # key problem: another model will not help
+            break
+    raise RuntimeError(last)
+
+
+def explain_ai_error(e):
+    msg = str(e)
+    if msg.startswith("401"):
+        return ("The AI key was rejected. Check that GROQ_API_KEY in Secrets is copied fully "
+                "(starts with gsk_), inside quotes, with no spaces.")
+    if msg.startswith("429"):
+        return "The free AI limit was reached for now. Please wait a minute and try again."
+    return "The AI service gave an error. Details for the app owner: " + msg
 
 
 def parse_json(text):
@@ -527,10 +544,17 @@ elif ss.step == 2:
         with st.expander("More options"):
             region = st.text_input("Country or city", value="India")
         if st.button("🔍  Find them", type="primary", disabled=not sector.strip()):
+            comps, failed = [], False
             with st.spinner("Looking for companies. This takes about a minute..."):
-                comps = find_companies(sector.strip(), count, entity, region)
+                try:
+                    comps = find_companies(sector.strip(), count, entity, region)
+                except Exception as e:
+                    failed = True
+                    st.error(explain_ai_error(e))
             df = pd.DataFrame(comps)
-            if df.empty:
+            if failed:
+                pass
+            elif df.empty:
                 st.error("We couldn't find any. Try a simpler or broader type, like 'fintech'.")
             else:
                 df.insert(0, "Include", True)
@@ -559,7 +583,11 @@ elif ss.step == 2:
             found, bar = [], st.progress(0.0, text="Searching...")
             with ThreadPoolExecutor(2) as ex:
                 for i, f in enumerate(as_completed([ex.submit(lookup_person, n) for n in lst]), 1):
-                    found.append(f.result())
+                    try:
+                        found.append(f.result())
+                    except Exception as e:
+                        st.error(explain_ai_error(e))
+                        st.stop()
                     bar.progress(i / len(lst), text=f"Done {i} of {len(lst)}")
             ss.result = build_dataframe(found, to_cols(ig, em, ph))
             ss.step = 4
